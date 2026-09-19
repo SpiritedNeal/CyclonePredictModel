@@ -4,6 +4,8 @@ torch
 numpy
 pydantic
 pandas
+requests
 xarray
-pydap
+cfgrib
+eccodes
 scikit-learn
