@@ -32,7 +32,7 @@ GRID_SIZE = 81
 
 PRESSURE_LEVELS = [200, 500, 850, 925]
 GFS_TIMEOUT = int(os.getenv("GFS_TIMEOUT", "60"))
-CODE_VERSION = "2026-09-19-gfs-direct-field-v4"
+CODE_VERSION = "2026-09-19-tcnd-aligned-v5"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -322,140 +322,216 @@ def classify_basin(latitude: float, longitude: float) -> int:
 
 
 def intensity_class_index(wind_mps: float) -> int:
-    # Six broad classes to match the 6-element categorical input.
-    # The exact bins were not retained as a standalone metadata file, so these
-    # are kept deterministic rather than making the API require a training ID.
-    knots = max(0.0, wind_mps) * 1.94384449
-    if knots < 34:
+    """Exact 6-class TCND environment intensity bins."""
+    if wind_mps < 17.1:
         return 0
-    if knots < 64:
+    if wind_mps < 24.4:
         return 1
-    if knots < 83:
+    if wind_mps < 32.6:
         return 2
-    if knots < 96:
+    if wind_mps < 41.4:
         return 3
-    if knots < 113:
+    if wind_mps < 50.9:
         return 4
     return 5
 
 
-def direction_class(degrees: float) -> int:
-    # 8 directional sectors: N, NE, E, SE, S, SW, W, NW
-    return int(((degrees + 22.5) % 360) // 45)
+def direction_onehot_from_raw(raw_lons: List[float], raw_lats: List[float]) -> np.ndarray:
+    """Reproduce the direction encoding used by the TCND environment script."""
+    raw_lons = list(raw_lons)
+    raw_lats = list(raw_lats)
 
+    if len(raw_lons) < 2 or len(raw_lats) < 2:
+        return np.zeros(8, dtype=np.float64)
 
-def movement_features(observations: List[Observation]) -> Dict[str, Any]:
-    lons = np.array([normalize_longitude(o.longitude) for o in observations], dtype=np.float64)
-    lats = np.array([o.latitude for o in observations], dtype=np.float64)
-    winds = np.array([o.wind for o in observations], dtype=np.float64)
+    long_rel = raw_lons[-1] - raw_lons[0]
+    lat_rel = raw_lats[-1] - raw_lats[0]
 
-    def haversine_km(lat1, lon1, lat2, lon2):
-        r = 6371.0
-        p1 = math.radians(lat1)
-        p2 = math.radians(lat2)
-        dp = math.radians(lat2 - lat1)
-        dl = math.radians(lon2 - lon1)
-        a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-        return 2 * r * math.asin(math.sqrt(max(0.0, min(1.0, a))))
+    # Original TCND implementation uses 0.1-degree coordinate units.
+    long_distance = (long_rel / 10.0) * 111.0 * math.cos(
+        (raw_lats[0] + raw_lats[1]) / 2.0 / 10.0 * math.pi / 180.0
+    )
+    lat_distance = (lat_rel / 10.0) * 111.0
 
-    distances = []
-    bearings = []
-    for i in range(1, len(observations)):
-        distances.append(haversine_km(lats[i - 1], lons[i - 1], lats[i], lons[i]))
+    velocity = math.sqrt(long_distance ** 2 + lat_distance ** 2)
+    if velocity == 0:
+        result = np.zeros(8, dtype=np.float64)
+        result[0] = 1.0
+        return result
 
-        lat1 = math.radians(lats[i - 1])
-        lat2 = math.radians(lats[i])
-        dl = math.radians(lons[i] - lons[i - 1])
-        y = math.sin(dl) * math.cos(lat2)
-        x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dl)
-        bearing = (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
-        bearings.append(bearing)
+    sin_angle = lat_distance / velocity
+    cos_angle = long_distance / velocity
+    sin_angle = max(-1.0, min(1.0, sin_angle))
 
-    if distances:
-        velocity_kmh = distances[-1] / 6.0
-        latest_direction = bearings[-1]
-        direction_12 = bearings[-2] if len(bearings) >= 2 else latest_direction
-        direction_24 = bearings[-4] if len(bearings) >= 4 else latest_direction
+    if sin_angle >= 0 and cos_angle >= 0:
+        angle = math.asin(sin_angle)
+    elif sin_angle >= 0 and cos_angle <= 0:
+        angle = math.pi - math.asin(sin_angle)
+    elif sin_angle <= 0 and cos_angle <= 0:
+        angle = math.pi - math.asin(sin_angle)
     else:
-        velocity_kmh = 0.0
-        latest_direction = 0.0
-        direction_12 = 0.0
-        direction_24 = 0.0
+        angle = 2.0 * math.pi + math.asin(sin_angle)
 
-    current = observations[-1]
-    current_wind = float(current.wind)
+    angle_lists = [
+        (math.pi * (1 / 8), 2 * math.pi - math.pi * (1 / 8)),
+        (2 * math.pi - math.pi * (1 / 8), 2 * math.pi - math.pi * (3 / 8)),
+        (2 * math.pi - math.pi * (3 / 8), 2 * math.pi - math.pi * (5 / 8)),
+        (2 * math.pi - math.pi * (5 / 8), 2 * math.pi - math.pi * (7 / 8)),
+        (2 * math.pi - math.pi * (7 / 8), 2 * math.pi - math.pi * (9 / 8)),
+        (2 * math.pi - math.pi * (9 / 8), 2 * math.pi - math.pi * (11 / 8)),
+        (2 * math.pi - math.pi * (11 / 8), 2 * math.pi - math.pi * (13 / 8)),
+        (2 * math.pi - math.pi * (13 / 8), 2 * math.pi - math.pi * (15 / 8)),
+    ]
 
-    change_24 = current_wind - float(observations[-5].wind)
-    change_12 = current_wind - float(observations[-3].wind)
+    angle_class = 0
+    for class_id, (low, high) in enumerate(angle_lists):
+        if class_id == 0:
+            if angle > high or angle <= low:
+                angle_class = class_id
+                break
+        else:
+            if angle > high and angle < low:
+                angle_class = class_id
+                break
 
-    return {
-        "velocity_kmh": velocity_kmh,
-        "latest_direction": latest_direction,
-        "direction_12": direction_12,
-        "direction_24": direction_24,
-        "change_12": change_12,
-        "change_24": change_24,
-        "current_wind": current_wind,
-    }
+    result = np.zeros(8, dtype=np.float64)
+    result[angle_class] = 1.0
+    return result
 
 
-def build_environment_raw(observations: List[Observation]) -> np.ndarray:
-    current = observations[-1]
-    movement = movement_features(observations)
+def intensity_change_onehot(winds_mps: List[float]) -> np.ndarray:
+    """Reproduce TCND's 24-hour intensity-change classification."""
+    winds = list(winds_mps)
+    if len(winds) < 2:
+        return np.zeros(4, dtype=np.float64)
+
+    grad = [winds[i + 1] - winds[i] for i in range(len(winds) - 1)]
+    g = np.asarray(grad, dtype=np.float64)
+
+    if np.all(g == 0):
+        cls = 3
+    elif np.all(g >= 0):
+        cls = 0
+    elif np.all(g <= 0):
+        cls = 2
+    else:
+        nonzero = np.flatnonzero(g)
+        if len(nonzero) and g[nonzero[0]] > 0 and g[nonzero[-1]] < 0:
+            cls = 1
+        elif np.sum(g) > 0:
+            cls = 0
+        elif np.sum(g) < 0:
+            cls = 2
+        else:
+            cls = 3
+
+    result = np.zeros(4, dtype=np.float64)
+    result[cls] = 1.0
+    return result
+
+
+def physical_to_tcnd_observation(longitude: float, latitude: float, pressure: float, wind: float) -> List[float]:
+    """Convert physical units to the exact Data1D representation used by TCND."""
+    lon360 = longitude_0_360(longitude)
+    lon_raw_01deg = lon360 * 10.0
+    lat_raw_01deg = latitude * 10.0
+
+    return [
+        (lon_raw_01deg - 1800.0) / 50.0,
+        lat_raw_01deg / 50.0,
+        (pressure - 960.0) / 50.0,
+        (wind - 40.0) / 25.0,
+    ]
+
+
+def tcnd_to_physical_prediction(values: np.ndarray) -> np.ndarray:
+    """Convert [LONG, LAT, PRES, WND] from TCND normalized units to physical units."""
+    values = np.asarray(values, dtype=np.float64)
+    out = np.empty_like(values, dtype=np.float64)
+
+    lon_raw = values[..., 0] * 50.0 + 1800.0
+    lat_raw = values[..., 1] * 50.0
+
+    out[..., 0] = lon_raw / 10.0
+    out[..., 1] = lat_raw / 10.0
+    out[..., 2] = values[..., 2] * 50.0 + 960.0
+    out[..., 3] = values[..., 3] * 25.0 + 40.0
+
+    return out.astype(np.float32)
+
+def build_environment_raw(observations: List[Observation], index: int) -> np.ndarray:
+    """Build the exact 96-D TCND Env-Data vector for one history timestep."""
+    current = observations[index]
+
+    # TCND environment processing uses longitude in 0.1-degree E units.
+    raw_lons = [longitude_0_360(o.longitude) * 10.0 for o in observations]
+    raw_lats = [o.latitude * 10.0 for o in observations]
+    winds = [float(o.wind) for o in observations]
+
+    raw_lon = raw_lons[index]
+    raw_lat = raw_lats[index]
 
     raw: List[float] = []
 
-    # 6 - basin one-hot
+    # 6 - area one-hot. Basin boundaries are necessarily inferred because the
+    # API intentionally does not require a basin/cyclone identifier.
     basin_idx = classify_basin(current.latitude, current.longitude)
     raw.extend(one_hot(basin_idx, 6))
 
-    # 1 - current wind
-    raw.append(float(current.wind))
+    # 1 - environment wind is WND / 110 in the original TCND env-data code.
+    raw.append(float(current.wind) / 110.0)
 
-    # 6 - intensity class one-hot
-    raw.extend(one_hot(intensity_class_index(current.wind), 6))
+    # 6 - intensity class uses the original m/s thresholds.
+    raw.extend(one_hot(intensity_class_index(float(current.wind)), 6))
 
-    # 1 - movement velocity
-    raw.append(float(movement["velocity_kmh"]))
+    # 1 - movement velocity. First timestep is zero.
+    if index == 0:
+        move_velocity = 0.0
+    else:
+        long_rel = raw_lons[index] - raw_lons[index - 1]
+        lat_rel = raw_lats[index] - raw_lats[index - 1]
+        long_distance = (long_rel / 10.0) * 111.0 * math.cos(
+            (raw_lats[index - 1] + raw_lats[index]) / 2.0 / 10.0 * math.pi / 180.0
+        )
+        lat_distance = (lat_rel / 10.0) * 111.0
+        velocity_km = math.sqrt(long_distance ** 2 + lat_distance ** 2)
+        move_velocity = velocity_km / 1219.8387650082498
+    raw.append(float(move_velocity))
 
     # 12 - month one-hot
-    month_index = parse_timestamp(current.timestamp).month - 1
-    raw.extend(one_hot(month_index, 12))
+    raw.extend(one_hot(parse_timestamp(current.timestamp).month - 1, 12))
 
-    # 2 - current location
-    raw.extend([float(current.longitude), float(current.latitude)])
+    # 2 - original environment location coordinates in 0.1-degree units.
+    raw.extend([float(raw_lon), float(raw_lat)])
 
-    # 36 - longitude positional bins (30-degree sectors)
-    lon360 = longitude_0_360(current.longitude)
-    lon_bin = min(11, int(lon360 // 30.0))
-    raw.extend(one_hot(lon_bin, 12))
-    raw.extend(one_hot(lon_bin, 12))
-    raw.extend(one_hot(int((lon360 / 360.0) * 12) % 12, 12))
-
-    # 12 - latitude bins
-    lat = max(-90.0, min(89.999, current.latitude))
-    lat_bin = min(11, int((lat + 90.0) // 15.0))
+    # 36 + 12 - global location one-hot encoding from TCND.
+    lon_bin = int((raw_lon // 10.0) // 10.0)
+    lat_bin = int((raw_lat + 600.0) // 100.0)
+    lon_bin = max(0, min(35, lon_bin))
+    lat_bin = max(0, min(11, lat_bin))
+    raw.extend(one_hot(lon_bin, 36))
     raw.extend(one_hot(lat_bin, 12))
 
-    # 8 - latest movement direction
-    raw.extend(one_hot(direction_class(movement["latest_direction"]), 8))
-
-    # 8 - 24h movement direction
-    raw.extend(one_hot(direction_class(movement["direction_24"]), 8))
-
-    # 4 - 24h intensity change category
-    delta = movement["change_24"]
-    if delta < -5:
-        change_idx = 0
-    elif delta < 0:
-        change_idx = 1
-    elif delta < 5:
-        change_idx = 2
+    # 8 - 12h movement direction. TCND uses the previous 2 intervals.
+    if index < 2:
+        raw.extend(np.zeros(8, dtype=np.float64).tolist())
     else:
-        change_idx = 3
-    raw.extend(one_hot(change_idx, 4))
+        raw.extend(direction_onehot_from_raw(raw_lons[index - 2:index + 1], raw_lats[index - 2:index + 1]).tolist())
 
-    arr = np.asarray(raw, dtype=np.float32)
+    # 8 - 24h movement direction. TCND uses the previous 4 intervals.
+    if index < 4:
+        raw.extend(np.zeros(8, dtype=np.float64).tolist())
+    else:
+        raw.extend(direction_onehot_from_raw(raw_lons[index - 4:index + 1], raw_lats[index - 4:index + 1]).tolist())
+
+    # 4 - 24h intensity change.
+    if index < 4:
+        raw.extend(np.zeros(4, dtype=np.float64).tolist())
+    else:
+        raw.extend(intensity_change_onehot(winds[index - 4:index + 1]).tolist())
+
+    arr = np.asarray(raw, dtype=np.float64)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
     if arr.shape != (ENV_FEATURES,):
         raise RuntimeError(f"Environment vector has shape {arr.shape}, expected (96,)")
@@ -464,20 +540,9 @@ def build_environment_raw(observations: List[Observation]) -> np.ndarray:
 
 
 def build_environment_sequence(observations: List[Observation]) -> np.ndarray:
-    """Build one 96-D environment vector for every historical timestep."""
-    vectors = []
-
-    for i in range(len(observations)):
-        prefix = observations[: i + 1]
-
-        # For early points, pad with the earliest observation so derived
-        # history-dependent features remain defined.
-        if len(prefix) < 5:
-            prefix = [prefix[0]] * (5 - len(prefix)) + prefix
-
-        vectors.append(build_environment_raw(prefix))
-
-    return np.stack(vectors, axis=0).astype(np.float32)
+    """Build one exact 96-D Env-Data vector for every historical timestep."""
+    vectors = [build_environment_raw(observations, i) for i in range(len(observations))]
+    return np.stack(vectors, axis=0).astype(np.float64)
 
 
 # ============================================================
@@ -743,47 +808,47 @@ def fetch_one_gfs_frame(timestamp: datetime, latitude: float, longitude: float):
 
 
 def build_track_array(observations: List[Observation]) -> np.ndarray:
+    """Convert user-facing physical observations to TCND Data1D normalized values."""
     track = np.array(
         [
-            [
-                normalize_longitude(o.longitude),
-                o.latitude,
-                o.pressure,
-                o.wind,
-            ]
+            physical_to_tcnd_observation(
+                float(o.longitude),
+                float(o.latitude),
+                float(o.pressure),
+                float(o.wind),
+            )
             for o in observations
         ],
-        dtype=np.float32,
+        dtype=np.float64,
     )
+
+    if track.shape != (INPUT_STEPS, TRACK_FEATURES):
+        raise RuntimeError(f"Track array shape is {track.shape}; expected ({INPUT_STEPS}, {TRACK_FEATURES})")
+
     return track
 
 
 def inverse_transform_predictions(pred_scaled: np.ndarray) -> np.ndarray:
-    """
-    CRITICAL STEP:
-    Model outputs are in target-scaled space. Convert them back to the original
-    [longitude, latitude, pressure, wind] units using target_scaler.
-    """
+    """Undo StandardScaler and then undo TCND Data1D normalization."""
     if target_scaler is None:
         raise RuntimeError("target_scaler is not loaded")
 
     original_shape = pred_scaled.shape
     flat = pred_scaled.reshape(-1, TRACK_FEATURES)
 
-    physical = target_scaler.inverse_transform(flat)
+    # Step 1: StandardScaler inverse transform -> TCND normalized values.
+    tcnd_values = target_scaler.inverse_transform(flat)
+
+    # Step 2: TCND normalized values -> physical lon/lat/pressure/wind.
+    physical = tcnd_to_physical_prediction(tcnd_values)
     return physical.reshape(original_shape).astype(np.float32)
 
 
 def sanitize_physical_prediction(row: np.ndarray) -> Dict[str, float]:
-    # Do not clamp pressure or latitude here. The purpose of this step is to
-    # expose the actual inverse-transformed model output rather than hide a
-    # model/scaler problem behind artificial physical limits.
+    """Format model output that is already in physical units."""
     longitude = float(normalize_longitude(float(row[0])))
     latitude = float(row[1])
     pressure_hpa = float(row[2])
-
-    # Wind cannot be physically negative, and the deployed API intentionally
-    # treats the model output as absolute wind speed, not wind change.
     wind_mps = float(max(0.0, float(row[3])))
     wind_knots = wind_mps * 1.94384449
 
@@ -814,6 +879,7 @@ def root():
         "endpoint": "POST /predict",
         "required_observations": INPUT_STEPS,
         "code_version": CODE_VERSION,
+        "tcnd_data1d_normalized": True,
     }
 
 
@@ -830,6 +896,14 @@ def health():
     if LOAD_ERROR is None and target_scaler is not None:
         result["target_scaler_mean"] = [float(x) for x in target_scaler.mean_]
         result["target_scaler_scale"] = [float(x) for x in target_scaler.scale_]
+
+    result["tcnd_normalization"] = {
+        "longitude": "(longitude_0_to_360_deg * 10 - 1800) / 50",
+        "latitude": "(latitude_deg * 10) / 50",
+        "pressure_hpa": "(pressure_hpa - 960) / 50",
+        "wind_mps": "(wind_mps - 40) / 25",
+        "target_output": "StandardScaler inverse_transform, then TCND denormalization",
+    }
 
     return result
 
@@ -965,6 +1039,13 @@ def predict(request: PredictionRequest):
             "last_observed_timestamp": observations[-1].timestamp,
             "forecast_hours": forecast_hours,
             "atmospheric_source": "NOAA GFS 0.25 degree (2m temperature proxy for training SST channel)",
+            "output_units": {
+                "longitude": "degrees",
+                "latitude": "degrees",
+                "pressure_hpa": "hPa",
+                "wind_mps": "m/s",
+                "wind_knots": "kt",
+            },
             "gfs_frames_available": gfs_frames_available,
             "gfs_frames_missing": gfs_frames_missing,
             "gfs_failures": gfs_failures,
