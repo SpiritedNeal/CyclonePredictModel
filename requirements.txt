@@ -1,5 +1,8 @@
 fastapi
-uvicorn[standard]
+uvicorn
 torch
 numpy
-scikit-learn
+pydantic
+pandas
+xarray
+pydap
