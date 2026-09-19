@@ -49,7 +49,7 @@ app = FastAPI(
 class GridEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
+        self.network = nn.Sequential(
             nn.Conv2d(THREE_D_CHANNELS, 32, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(2),
@@ -63,10 +63,9 @@ class GridEncoder(nn.Module):
         self.fc = nn.Linear(128, 64)
 
     def forward(self, x):
-        x = self.net(x)
+        x = self.network(x)
         x = x.flatten(1)
         return self.fc(x)
-
 
 class CycloneModel(nn.Module):
     def __init__(self):
