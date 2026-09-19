@@ -1,11 +1,13 @@
 import os
 import math
+import time
+import tempfile
 from datetime import datetime, timedelta
 
 import numpy as np
-import pandas as pd
-import pickle
+import requests
 import xarray as xr
+import pickle
 
 import torch
 import torch.nn as nn
@@ -47,8 +49,31 @@ PRESSURE_LEVELS = [
     925
 ]
 
+# NOAA asks automated users to pause between requests.
+GFS_REQUEST_DELAY = float(
+    os.getenv(
+        "GFS_REQUEST_DELAY",
+        "10"
+    )
+)
+
+GFS_TIMEOUT = int(
+    os.getenv(
+        "GFS_TIMEOUT",
+        "90"
+    )
+)
+
+GFS_MAX_LOOKBACK_HOURS = int(
+    os.getenv(
+        "GFS_MAX_LOOKBACK_HOURS",
+        "48"
+    )
+)
+
 DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available()
+    "cuda"
+    if torch.cuda.is_available()
     else "cpu"
 )
 
@@ -61,14 +86,7 @@ AREA_ORDER = [
     "WP"
 ]
 
-# TCND uses this exact normalization for movement velocity.
 VELOCITY_DIVISOR = 1219.8387650082498
-
-CLASS_NAMES = [
-    "LOW",
-    "MEDIUM",
-    "HIGH"
-]
 
 
 # ============================================================
@@ -78,7 +96,6 @@ CLASS_NAMES = [
 class GridEncoder(nn.Module):
 
     def __init__(self):
-
         super().__init__()
 
         self.network = nn.Sequential(
@@ -124,6 +141,7 @@ class GridEncoder(nn.Module):
             GRID_FEATURES
         )
 
+
     def forward(self, x):
 
         x = self.network(x)
@@ -138,7 +156,6 @@ class GridEncoder(nn.Module):
 class CycloneModel(nn.Module):
 
     def __init__(self):
-
         super().__init__()
 
         lstm_input = (
@@ -172,6 +189,7 @@ class CycloneModel(nn.Module):
                 OUTPUT_STEPS * 4
             )
         )
+
 
     def forward(
         self,
@@ -237,24 +255,24 @@ class CycloneModel(nn.Module):
 # ============================================================
 
 app = FastAPI(
-    title="Cyclone Future Prediction API",
-    version="2.0.0",
+    title="Cyclone Multimodal Prediction API",
+    version="3.0.0",
     description=(
-        "Accepts 8 historical cyclone observations and "
-        "automatically builds the environmental and "
-        "3D atmospheric inputs."
+        "Predicts the next 24 hours from eight historical cyclone "
+        "observations. Environmental features are reconstructed "
+        "from the track and 3D atmospheric fields are retrieved "
+        "from NOAA GFS."
     )
 )
-
-
-# ============================================================
-# LOAD MODEL
-# ============================================================
 
 model = None
 scalers = None
 startup_error = None
 
+
+# ============================================================
+# LOAD MODEL
+# ============================================================
 
 @app.on_event("startup")
 def load_artifacts():
@@ -307,9 +325,13 @@ def load_artifacts():
 
         print("=" * 60)
         print("Cyclone API started")
-        print("Device:", DEVICE)
-        print("Model:", MODEL_PATH)
-        print("Scalers:", SCALER_PATH)
+        print(f"Device: {DEVICE}")
+        print(f"Model: {MODEL_PATH}")
+        print(f"Scalers: {SCALER_PATH}")
+        print(
+            f"GFS request delay: "
+            f"{GFS_REQUEST_DELAY}s"
+        )
         print("=" * 60)
 
     except Exception as e:
@@ -325,7 +347,7 @@ def load_artifacts():
 
 
 # ============================================================
-# INPUT DATA MODEL
+# INPUT SCHEMA
 # ============================================================
 
 class Observation(BaseModel):
@@ -335,15 +357,9 @@ class Observation(BaseModel):
         description="UTC timestamp in YYYYMMDDHH format."
     )
 
-    longitude: float = Field(
-        ...,
-        description="Cyclone longitude in degrees."
-    )
+    longitude: float
 
-    latitude: float = Field(
-        ...,
-        description="Cyclone latitude in degrees."
-    )
+    latitude: float
 
     pressure: float = Field(
         ...,
@@ -362,12 +378,15 @@ class PredictionRequest(BaseModel):
         ...,
         min_length=8,
         max_length=8,
-        description="Exactly 8 observations spaced 6 hours apart."
+        description=(
+            "Exactly 8 observations, "
+            "6 hours apart."
+        )
     )
 
 
 # ============================================================
-# TIME FUNCTIONS
+# BASIC HELPERS
 # ============================================================
 
 def parse_timestamp(timestamp):
@@ -379,15 +398,26 @@ def parse_timestamp(timestamp):
             "%Y%m%d%H"
         )
 
-    except ValueError:
+    except ValueError as exc:
 
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Invalid timestamp '{timestamp}'. "
+                f"Invalid timestamp "
+                f"'{timestamp}'. "
                 "Use YYYYMMDDHH."
             )
-        )
+        ) from exc
+
+
+def normalize_longitude(longitude):
+
+    value = longitude % 360.0
+
+    if value < 0:
+        value += 360.0
+
+    return value
 
 
 def validate_observations(
@@ -398,70 +428,91 @@ def validate_observations(
 
         raise HTTPException(
             status_code=400,
-            detail="Exactly 8 observations are required."
+            detail=(
+                "Exactly 8 observations "
+                "are required."
+            )
         )
 
     dates = [
         parse_timestamp(
-            observation.timestamp
+            x.timestamp
         )
-        for observation in observations
+        for x in observations
     ]
-
-    for i in range(7):
-
-        difference = (
-            dates[i + 1]
-            - dates[i]
-        )
-
-        if difference != timedelta(
-            hours=6
-        ):
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Observations must be exactly "
-                    "6 hours apart."
-                )
-            )
 
     if dates != sorted(dates):
 
         raise HTTPException(
             status_code=400,
-            detail="Observations must be chronological."
+            detail=(
+                "Observations must be "
+                "chronological."
+            )
         )
+
+    for i in range(7):
+
+        if (
+            dates[i + 1]
+            - dates[i]
+        ) != timedelta(hours=6):
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Observations must be "
+                    "exactly 6 hours apart."
+                )
+            )
 
     for observation in observations:
 
-        if not -180 <= observation.longitude <= 360:
+        if not (
+            -180
+            <= observation.longitude
+            <= 360
+        ):
 
             raise HTTPException(
                 status_code=400,
-                detail="Invalid longitude."
+                detail=(
+                    "Longitude must be "
+                    "between -180 and 360."
+                )
             )
 
-        if not -90 <= observation.latitude <= 90:
+        if not (
+            -90
+            <= observation.latitude
+            <= 90
+        ):
 
             raise HTTPException(
                 status_code=400,
-                detail="Invalid latitude."
+                detail=(
+                    "Latitude must be "
+                    "between -90 and 90."
+                )
             )
 
         if observation.pressure <= 0:
 
             raise HTTPException(
                 status_code=400,
-                detail="Pressure must be positive."
+                detail=(
+                    "Pressure must be positive."
+                )
             )
 
         if observation.wind < 0:
 
             raise HTTPException(
                 status_code=400,
-                detail="Wind must be non-negative and in m/s."
+                detail=(
+                    "Wind must be non-negative "
+                    "and in m/s."
+                )
             )
 
 
@@ -469,11 +520,7 @@ def validate_observations(
 # TCND ENVIRONMENT FEATURES
 # ============================================================
 
-def get_intensity(
-    wind
-):
-
-    intensity_class = 0
+def get_intensity(wind):
 
     if wind < 17.1:
 
@@ -499,48 +546,60 @@ def get_intensity(
 
         intensity_class = 5
 
-    output = np.zeros(
+    result = np.zeros(
         6,
         dtype=np.float64
     )
 
-    output[
+    result[
         intensity_class
     ] = 1.0
 
-    return output
+    return result
 
 
 def get_velocity(
-    lon1,
-    lat1,
-    lon2,
-    lat2
+    longitudes,
+    latitudes
 ):
 
-    long_rel = lon2 - lon1
+    long_rel = (
+        longitudes[1]
+        - longitudes[0]
+    )
 
-    lat_rel = lat2 - lat1
+    lat_rel = (
+        latitudes[1]
+        - latitudes[0]
+    )
 
     long_distance = (
-        long_rel / 10
-    ) * 111 * math.cos(
-        ((lat1 + lat2) / 2)
-        / 10
-        * math.pi
-        / 180
+        (long_rel / 10.0)
+        * 111.0
+        * math.cos(
+            (
+                (
+                    latitudes[0]
+                    + latitudes[1]
+                )
+                / 2.0
+            )
+            / 10.0
+            * math.pi
+            / 180.0
+        )
     )
 
     lat_distance = (
-        lat_rel / 10
-    ) * 111
+        lat_rel
+        / 10.0
+        * 111.0
+    )
 
-    velocity = math.sqrt(
+    return math.sqrt(
         long_distance ** 2
         + lat_distance ** 2
     )
-
-    return velocity
 
 
 def get_location_for_all(
@@ -548,12 +607,10 @@ def get_location_for_all(
     latitude
 ):
 
-    # Longitude: 0-360, 10 degree bins.
     x = int(
         (longitude // 10) // 10
     )
 
-    # Latitude: -60 to +60, 10 degree bins.
     y = int(
         (latitude + 600) // 100
     )
@@ -568,22 +625,22 @@ def get_location_for_all(
         min(11, y)
     )
 
-    location_long = np.zeros(
+    location_x = np.zeros(
         36,
         dtype=np.float64
     )
 
-    location_lat = np.zeros(
+    location_y = np.zeros(
         12,
         dtype=np.float64
     )
 
-    location_long[x] = 1.0
-    location_lat[y] = 1.0
+    location_x[x] = 1.0
+    location_y[y] = 1.0
 
     return (
-        location_long,
-        location_lat
+        location_x,
+        location_y
     )
 
 
@@ -611,20 +668,27 @@ def get_direction(
     )
 
     long_distance = (
-        long_rel / 10
-    ) * 111 * math.cos(
-        (
-            latitudes[0]
-            + latitudes[1]
+        (long_rel / 10.0)
+        * 111.0
+        * math.cos(
+            (
+                (
+                    latitudes[0]
+                    + latitudes[1]
+                )
+                / 2.0
+            )
+            / 10.0
+            * math.pi
+            / 180.0
         )
-        / 10
-        * math.pi
-        / 180
     )
 
     lat_distance = (
-        lat_rel / 10
-    ) * 111
+        lat_rel
+        / 10.0
+        * 111.0
+    )
 
     velocity = math.sqrt(
         long_distance ** 2
@@ -633,14 +697,19 @@ def get_direction(
 
     if velocity == 0:
 
-        output = np.zeros(
-            8,
+        return np.array(
+            [
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+            ],
             dtype=np.float64
         )
-
-        output[0] = 1.0
-
-        return output
 
     sin_angle = (
         lat_distance
@@ -650,6 +719,11 @@ def get_direction(
     cos_angle = (
         long_distance
         / velocity
+    )
+
+    sin_angle = max(
+        -1.0,
+        min(1.0, sin_angle)
     )
 
     if (
@@ -668,7 +742,9 @@ def get_direction(
 
         angle = (
             math.pi
-            - math.asin(sin_angle)
+            - math.asin(
+                sin_angle
+            )
         )
 
     elif (
@@ -678,7 +754,9 @@ def get_direction(
 
         angle = (
             math.pi
-            - math.asin(sin_angle)
+            - math.asin(
+                sin_angle
+            )
         )
 
     elif (
@@ -688,7 +766,9 @@ def get_direction(
 
         angle = (
             2 * math.pi
-            + math.asin(sin_angle)
+            + math.asin(
+                sin_angle
+            )
         )
 
     else:
@@ -782,16 +862,16 @@ def get_direction(
                 angle_class = class_id
                 break
 
-    output = np.zeros(
+    result = np.zeros(
         8,
         dtype=np.float64
     )
 
-    output[
+    result[
         angle_class
     ] = 1.0
 
-    return output
+    return result
 
 
 def get_intensity_change(
@@ -857,24 +937,27 @@ def get_intensity_change(
             )
 
             if total > 0:
+
                 intensity_class = 0
 
             elif total < 0:
+
                 intensity_class = 2
 
             else:
+
                 intensity_class = 3
 
-    output = np.zeros(
+    result = np.zeros(
         4,
         dtype=np.float64
     )
 
-    output[
+    result[
         intensity_class
     ] = 1.0
 
-    return output
+    return result
 
 
 def build_environment_vector(
@@ -882,20 +965,13 @@ def build_environment_vector(
     index
 ):
 
-    observation = observations[
+    current = observations[
         index
     ]
 
-    longitude = observation.longitude
-    latitude = observation.latitude
-    wind = observation.wind
-
     parts = []
 
-    # --------------------------------------------------------
-    # Area: NI
-    # --------------------------------------------------------
-
+    # Area = NI.
     area = np.zeros(
         6,
         dtype=np.float64
@@ -909,31 +985,24 @@ def build_environment_vector(
         area
     )
 
-    # --------------------------------------------------------
-    # Wind
-    # --------------------------------------------------------
-
+    # Wind.
     parts.append(
         np.array(
-            [wind / 110.0],
+            [
+                current.wind / 110.0
+            ],
             dtype=np.float64
         )
     )
 
-    # --------------------------------------------------------
-    # Intensity class
-    # --------------------------------------------------------
-
+    # Intensity class.
     parts.append(
         get_intensity(
-            wind
+            current.wind
         )
     )
 
-    # --------------------------------------------------------
-    # Movement velocity
-    # --------------------------------------------------------
-
+    # Movement velocity.
     if index == 0:
 
         movement_velocity = 0.0
@@ -946,10 +1015,14 @@ def build_environment_vector(
 
         movement_velocity = (
             get_velocity(
-                previous.longitude,
-                previous.latitude,
-                longitude,
-                latitude
+                [
+                    previous.longitude,
+                    current.longitude
+                ],
+                [
+                    previous.latitude,
+                    current.latitude
+                ]
             )
             / VELOCITY_DIVISOR
         )
@@ -961,12 +1034,9 @@ def build_environment_vector(
         )
     )
 
-    # --------------------------------------------------------
-    # Month
-    # --------------------------------------------------------
-
+    # Month.
     month = parse_timestamp(
-        observation.timestamp
+        current.timestamp
     ).month
 
     month_onehot = np.zeros(
@@ -982,34 +1052,26 @@ def build_environment_vector(
         month_onehot
     )
 
-    # --------------------------------------------------------
-    # Location
-    # --------------------------------------------------------
-
+    # Raw location.
     parts.append(
         np.array(
             [
-                longitude,
-                latitude
+                current.longitude,
+                current.latitude
             ],
             dtype=np.float64
         )
     )
 
-    # --------------------------------------------------------
-    # Location longitude / latitude
-    # --------------------------------------------------------
-
-    longitude_360 = (
-        longitude
-        if longitude >= 0
-        else longitude + 360
+    # Location one-hot.
+    longitude_360 = normalize_longitude(
+        current.longitude
     )
 
     location_long, location_lat = (
         get_location_for_all(
             longitude_360,
-            latitude
+            current.latitude
         )
     )
 
@@ -1021,76 +1083,67 @@ def build_environment_vector(
         location_lat
     )
 
-    # --------------------------------------------------------
-    # History direction 12h
-    # --------------------------------------------------------
-
+    # 12-hour movement direction.
     if index < 2:
 
-        direction_12 = np.zeros(
+        direction12 = np.zeros(
             8,
             dtype=np.float64
         )
 
     else:
 
-        history = observations[
+        window = observations[
             index - 2:
             index + 1
         ]
 
-        direction_12 = get_direction(
+        direction12 = get_direction(
             [
-                item.longitude
-                for item in history
+                x.longitude
+                for x in window
             ],
             [
-                item.latitude
-                for item in history
+                x.latitude
+                for x in window
             ]
         )
 
     parts.append(
-        direction_12
+        direction12
     )
 
-    # --------------------------------------------------------
-    # History direction 24h
-    # --------------------------------------------------------
-
+    # 24-hour movement direction.
     if index < 4:
 
-        direction_24 = np.zeros(
+        direction24 = np.zeros(
             8,
             dtype=np.float64
         )
 
     else:
 
-        history = observations[
+        window = observations[
             index - 4:
             index + 1
         ]
 
-        direction_24 = get_direction(
+        direction24 = get_direction(
             [
-                item.longitude
-                for item in history
+                x.longitude
+                for x in window
             ],
             [
-                item.latitude
-                for item in history
+                x.latitude
+                for x in window
             ]
         )
 
     parts.append(
-        direction_24
+        direction24
     )
 
-    # --------------------------------------------------------
-    # Intensity change 24h
-    # --------------------------------------------------------
-
+    # 24-hour intensity change.
     if index < 4:
 
         intensity_change = np.zeros(
@@ -1100,7 +1153,7 @@ def build_environment_vector(
 
     else:
 
-        history = observations[
+        window = observations[
             index - 4:
             index + 1
         ]
@@ -1108,8 +1161,8 @@ def build_environment_vector(
         intensity_change = (
             get_intensity_change(
                 [
-                    item.wind
-                    for item in history
+                    x.wind
+                    for x in window
                 ]
             )
         )
@@ -1127,8 +1180,9 @@ def build_environment_vector(
     ):
 
         raise RuntimeError(
-            f"Environment vector has shape "
-            f"{vector.shape}; expected "
+            f"Environment vector has "
+            f"shape {vector.shape}; "
+            f"expected "
             f"({ENV_FEATURES},)."
         )
 
@@ -1136,287 +1190,470 @@ def build_environment_vector(
 
 
 # ============================================================
-# GFS DATA ACCESS
+# NOAA GFS GRIB2
 # ============================================================
 
-def timestamp_to_numpy_datetime(
-    timestamp
+def build_gfs_url(
+    cycle_dt,
+    forecast_hour,
+    latitude,
+    longitude
 ):
 
-    dt = parse_timestamp(
-        timestamp
+    date_string = (
+        cycle_dt.strftime(
+            "%Y%m%d"
+        )
     )
 
-    return np.datetime64(
-        dt
+    cycle_hour = (
+        cycle_dt.strftime(
+            "%H"
+        )
     )
 
+    fhr = (
+        f"{forecast_hour:03d}"
+    )
 
-def open_gfs_dataset(
-    target_datetime
+    center_lon = normalize_longitude(
+        longitude
+    )
+
+    left_lon = max(
+        0.0,
+        center_lon - 10.25
+    )
+
+    right_lon = min(
+        359.75,
+        center_lon + 10.25
+    )
+
+    bottom_lat = max(
+        -90.0,
+        latitude - 10.25
+    )
+
+    top_lat = min(
+        90.0,
+        latitude + 10.25
+    )
+
+    params = {
+
+        "file":
+            f"gfs.t{cycle_hour}z."
+            f"pgrb2.0p25.f{fhr}",
+
+        "lev_200_mb":
+            "on",
+
+        "lev_500_mb":
+            "on",
+
+        "lev_850_mb":
+            "on",
+
+        "lev_925_mb":
+            "on",
+
+        "lev_surface":
+            "on",
+
+        "var_HGT":
+            "on",
+
+        "var_TMP":
+            "on",
+
+        "var_UGRD":
+            "on",
+
+        "var_VGRD":
+            "on",
+
+        "subregion":
+            "",
+
+        "leftlon":
+            f"{left_lon:.2f}",
+
+        "rightlon":
+            f"{right_lon:.2f}",
+
+        "toplat":
+            f"{top_lat:.2f}",
+
+        "bottomlat":
+            f"{bottom_lat:.2f}",
+
+        "dir":
+            f"/gfs.{date_string}/"
+            f"{cycle_hour}/atmos"
+    }
+
+    request = requests.Request(
+        "GET",
+        (
+            "https://nomads.ncep.noaa.gov/"
+            "cgi-bin/filter_gfs_0p25.pl"
+        ),
+        params=params
+    ).prepare()
+
+    return request.url
+
+
+def choose_gfs_candidate(
+    target_dt
 ):
 
-    # Try the exact GFS cycle first, then older
-    # cycles if the current one is unavailable.
+    candidates = []
 
-    for hours_back in [
-        0,
+    # Exact analysis.
+    candidates.append(
+        (
+            target_dt,
+            0
+        )
+    )
+
+    # Older cycles + forecast hours.
+    for hours_back in range(
         6,
-        12,
-        18,
-        24,
-        30,
-        36,
-        42,
-        48
-    ]:
+        GFS_MAX_LOOKBACK_HOURS + 1,
+        6
+    ):
 
-        cycle_datetime = (
-            target_datetime
+        cycle_dt = (
+            target_dt
             - timedelta(
                 hours=hours_back
             )
         )
 
-        cycle_datetime = cycle_datetime.replace(
-            minute=0,
-            second=0,
-            microsecond=0
+        if cycle_dt.hour % 6 != 0:
+
+            continue
+
+        candidates.append(
+            (
+                cycle_dt,
+                hours_back
+            )
         )
 
-        cycle_datetime = cycle_datetime.replace(
-            hour=(
-                cycle_datetime.hour // 6
-            ) * 6
-        )
+    return candidates
 
-        date_string = (
-            cycle_datetime
-            .strftime("%Y%m%d")
-        )
 
-        hour_string = (
-            cycle_datetime
-            .strftime("%H")
-        )
+def download_gfs_file(
+    target_timestamp,
+    latitude,
+    longitude
+):
 
-        url = (
-            "https://nomads.ncep.noaa.gov/"
-            "dods/gfs_0p25_1hr/"
-            f"gfs{date_string}/"
-            f"gfs_0p25_1hr_{hour_string}z"
+    target_dt = parse_timestamp(
+        target_timestamp
+    )
+
+    last_error = None
+
+    candidates = (
+        choose_gfs_candidate(
+            target_dt
+        )
+    )
+
+    for candidate_index, (
+        cycle_dt,
+        forecast_hour
+    ) in enumerate(candidates):
+
+        if candidate_index > 0:
+
+            time.sleep(
+                GFS_REQUEST_DELAY
+            )
+
+        url = build_gfs_url(
+            cycle_dt,
+            forecast_hour,
+            latitude,
+            longitude
         )
 
         try:
 
-            ds = xr.open_dataset(
+            response = requests.get(
                 url,
-                engine="pydap"
+                timeout=GFS_TIMEOUT
             )
 
-            target_np = np.datetime64(
-                target_datetime
-            )
+            if response.status_code != 200:
 
-            time_values = pd.to_datetime(
-                ds["time"].values
-            ).values
-
-            differences = np.abs(
-                time_values
-                - target_np
-            )
-
-            time_index = int(
-                np.argmin(
-                    differences
+                last_error = (
+                    f"HTTP "
+                    f"{response.status_code}: "
+                    f"{response.text[:250]}"
                 )
-            )
-
-            difference_hours = (
-                abs(
-                    (
-                        time_values[
-                            time_index
-                        ]
-                        - target_np
-                    )
-                    / np.timedelta64(
-                        1,
-                        "h"
-                    )
-                )
-            )
-
-            if difference_hours > 1.1:
-
-                ds.close()
 
                 continue
 
+            if (
+                response.content[:4]
+                != b"GRIB"
+            ):
+
+                last_error = (
+                    "NOAA returned a "
+                    "non-GRIB response: "
+                    f"{response.text[:250]}"
+                )
+
+                continue
+
+            temp_file = (
+                tempfile.NamedTemporaryFile(
+                    suffix=".grib2",
+                    delete=False
+                )
+            )
+
+            temp_path = (
+                temp_file.name
+            )
+
+            try:
+
+                temp_file.write(
+                    response.content
+                )
+
+            finally:
+
+                temp_file.close()
+
             return (
-                ds,
-                time_index,
+                temp_path,
                 url
             )
 
-        except Exception:
+        except Exception as exc:
 
-            continue
+            last_error = str(exc)
 
     raise RuntimeError(
-        "Could not obtain GFS data for "
-        f"{target_datetime:%Y-%m-%d %H:%M} UTC."
+        "Could not obtain GFS data "
+        f"for {target_timestamp}. "
+        f"Last error: {last_error}"
     )
 
 
-def pad_to_81(
-    data
+def open_cfgrib_dataset(
+    path,
+    filter_by_keys
 ):
 
-    height = data.shape[-2]
-    width = data.shape[-1]
-
-    pad_height = (
-        GRID_SIZE
-        - height
+    return xr.open_dataset(
+        path,
+        engine="cfgrib",
+        backend_kwargs={
+            "filter_by_keys":
+                filter_by_keys,
+            "indexpath":
+                ""
+        }
     )
 
-    pad_width = (
-        GRID_SIZE
-        - width
+
+def get_variable(
+    dataset,
+    names
+):
+
+    for name in names:
+
+        if name in dataset.data_vars:
+
+            return dataset[name]
+
+    raise KeyError(
+        "Could not find variables "
+        f"{names}. Available: "
+        f"{list(dataset.data_vars)}"
     )
 
-    if pad_height < 0:
 
-        start = (
-            -pad_height
-        ) // 2
+def centered_indices(
+    values,
+    center_value
+):
 
-        data = data[
-            ...,
-            start:
-            start + GRID_SIZE,
-            :
-        ]
+    values = np.asarray(
+        values
+    )
 
-        pad_height = (
-            GRID_SIZE
-            - data.shape[-2]
-        )
-
-    if pad_width < 0:
-
-        start = (
-            -pad_width
-        ) // 2
-
-        data = data[
-            ...,
-            :,
-            start:
-            start + GRID_SIZE
-        ]
-
-        pad_width = (
-            GRID_SIZE
-            - data.shape[-1]
-        )
-
-    if (
-        pad_height > 0
-        or pad_width > 0
-    ):
-
-        data = np.pad(
-            data,
-            (
-                (0, 0)
-                if data.ndim == 3
-                else (),
+    nearest = int(
+        np.argmin(
+            np.abs(
+                values
+                - center_value
             )
         )
+    )
 
-    # Explicit edge padding.
+    start = (
+        nearest - 40
+    )
 
-    if data.shape[-2] < GRID_SIZE:
+    end = (
+        nearest + 41
+    )
 
-        amount = (
-            GRID_SIZE
-            - data.shape[-2]
+    if start < 0:
+
+        end -= start
+        start = 0
+
+    if end > len(values):
+
+        start -= (
+            end - len(values)
         )
 
-        data = np.pad(
-            data,
-            (
-                (0, 0),
-                (0, amount),
+        end = len(values)
+
+    start = max(
+        0,
+        start
+    )
+
+    end = min(
+        len(values),
+        end
+    )
+
+    return np.arange(
+        start,
+        end
+    )
+
+
+def force_81x81(
+    data,
+    lat_values,
+    lon_values,
+    center_lat,
+    center_lon
+):
+
+    lat_idx = centered_indices(
+        lat_values,
+        center_lat
+    )
+
+    lon_idx = centered_indices(
+        lon_values,
+        center_lon
+    )
+
+    result = data[
+        ...,
+        lat_idx,
+        :
+    ]
+
+    result = result[
+        ...,
+        :,
+        lon_idx
+    ]
+
+    if result.shape[-2] < GRID_SIZE:
+
+        pad = (
+            GRID_SIZE
+            - result.shape[-2]
+        )
+
+        result = np.pad(
+            result,
+            [(0, 0)]
+            * (result.ndim - 2)
+            + [
+                (0, pad),
                 (0, 0)
-            ),
+            ],
             mode="edge"
         )
 
-    if data.shape[-1] < GRID_SIZE:
+    if result.shape[-1] < GRID_SIZE:
 
-        amount = (
+        pad = (
             GRID_SIZE
-            - data.shape[-1]
+            - result.shape[-1]
         )
 
-        data = np.pad(
-            data,
-            (
+        result = np.pad(
+            result,
+            [(0, 0)]
+            * (result.ndim - 2)
+            + [
                 (0, 0),
-                (0, 0),
-                (0, amount)
-            ),
+                (0, pad)
+            ],
             mode="edge"
         )
 
-    return data
+    return result[
+        ...,
+        :GRID_SIZE,
+        :GRID_SIZE
+    ]
 
 
 def standardize_channel(
-    data
+    channel
 ):
 
-    data = np.asarray(
-        data,
+    channel = np.asarray(
+        channel,
         dtype=np.float64
     )
 
     valid = (
-        np.isfinite(data)
+        np.isfinite(channel)
         &
         (
-            np.abs(data)
+            np.abs(channel)
             < 1e6
         )
     )
 
     output = np.zeros_like(
-        data,
+        channel,
         dtype=np.float64
     )
 
     if np.any(valid):
 
-        valid_values = data[
+        values = channel[
             valid
         ]
 
         mean = np.mean(
-            valid_values,
+            values,
             dtype=np.float64
         )
 
         std = np.std(
-            valid_values,
+            values,
             dtype=np.float64
         )
 
-        if (
-            not np.isfinite(mean)
+        if not np.isfinite(
+            mean
         ):
 
             mean = 0.0
@@ -1428,10 +1665,19 @@ def standardize_channel(
 
             std = 1.0
 
-        output[valid] = (
-            data[valid]
+        output[
+            valid
+        ] = (
+            channel[valid]
             - mean
         ) / std
+
+    output = np.nan_to_num(
+        output,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0
+    )
 
     return np.clip(
         output,
@@ -1442,425 +1688,365 @@ def standardize_channel(
     )
 
 
-def get_gfs_3d(
-    timestamp,
-    latitude,
-    longitude
+def extract_gfs_tensor(
+    grib_path,
+    center_lat,
+    center_lon
 ):
 
-    target_datetime = parse_timestamp(
-        timestamp
-    )
+    # --------------------------------------------------------
+    # Pressure-level data
+    # --------------------------------------------------------
 
-    ds = None
+    pressure_ds = (
+        open_cfgrib_dataset(
+            grib_path,
+            {
+                "typeOfLevel":
+                    "isobaricInhPa"
+            }
+        )
+    )
 
     try:
 
-        ds, time_index, source_url = (
-            open_gfs_dataset(
-                target_datetime
-            )
+        u = get_variable(
+            pressure_ds,
+            [
+                "u",
+                "ugrd"
+            ]
         )
 
-        # Convert longitude to GFS's 0-360 system.
-
-        longitude_360 = (
-            longitude
-            if longitude >= 0
-            else longitude + 360
+        v = get_variable(
+            pressure_ds,
+            [
+                "v",
+                "vgrd"
+            ]
         )
 
-        lat_values = np.asarray(
-            ds["lat"].values
+        z = get_variable(
+            pressure_ds,
+            [
+                "gh",
+                "z",
+                "hgt"
+            ]
         )
 
-        lon_values = np.asarray(
-            ds["lon"].values
-        )
-
-        lat_index = int(
-            np.argmin(
-                np.abs(
-                    lat_values
-                    - latitude
-                )
-            )
-        )
-
-        lon_index = int(
-            np.argmin(
-                np.abs(
-                    lon_values
-                    - longitude_360
-                )
-            )
-        )
-
-        lat_start = max(
-            0,
-            lat_index - 40
-        )
-
-        lat_end = min(
-            len(lat_values),
-            lat_index + 41
-        )
-
-        lon_start = max(
-            0,
-            lon_index - 40
-        )
-
-        lon_end = min(
-            len(lon_values),
-            lon_index + 41
-        )
-
-        level_values = np.asarray(
-            ds["lev"].values
-        )
-
-        level_indices = []
-
-        for pressure_level in (
-            PRESSURE_LEVELS
+        if (
+            "isobaricInhPa"
+            in u.coords
         ):
 
-            index = int(
-                np.argmin(
-                    np.abs(
-                        level_values
-                        - pressure_level
-                    )
-                )
+            level_coord = (
+                "isobaricInhPa"
             )
 
-            level_indices.append(
-                index
-            )
+        elif "level" in u.coords:
 
-        required_variables = [
-            "ugrdprs",
-            "vgrdprs",
-            "hgtprs"
-        ]
-
-        # Surface temperature is used as the
-        # GFS SST proxy for the final channel.
-
-        if "tmpsfc" in ds:
-
-            surface_variable = "tmpsfc"
-
-        elif "tmp2m" in ds:
-
-            surface_variable = "tmp2m"
+            level_coord = "level"
 
         else:
 
             raise RuntimeError(
-                "GFS surface temperature variable "
-                "was not found."
+                "Could not find pressure "
+                "level coordinate."
             )
 
-        subset = ds[
-            required_variables
-            + [surface_variable]
-        ].isel(
-            time=time_index,
-            lat=slice(
-                lat_start,
-                lat_end
-            ),
-            lon=slice(
-                lon_start,
-                lon_end
-            )
+        u = u.sel(
+            {
+                level_coord:
+                    PRESSURE_LEVELS
+            },
+            method="nearest"
         )
 
-        u = np.asarray(
-            subset[
-                "ugrdprs"
-            ].isel(
-                lev=level_indices
-            ).values,
+        v = v.sel(
+            {
+                level_coord:
+                    PRESSURE_LEVELS
+            },
+            method="nearest"
+        )
+
+        z = z.sel(
+            {
+                level_coord:
+                    PRESSURE_LEVELS
+            },
+            method="nearest"
+        )
+
+        u = u.transpose(
+            level_coord,
+            "latitude",
+            "longitude"
+        )
+
+        v = v.transpose(
+            level_coord,
+            "latitude",
+            "longitude"
+        )
+
+        z = z.transpose(
+            level_coord,
+            "latitude",
+            "longitude"
+        )
+
+        lat_values = (
+            u["latitude"].values
+        )
+
+        lon_values = (
+            u["longitude"].values
+        )
+
+        u_data = np.asarray(
+            u.values,
             dtype=np.float64
         )
 
-        v = np.asarray(
-            subset[
-                "vgrdprs"
-            ].isel(
-                lev=level_indices
-            ).values,
+        v_data = np.asarray(
+            v.values,
             dtype=np.float64
         )
 
-        z = np.asarray(
-            subset[
-                "hgtprs"
-            ].isel(
-                lev=level_indices
-            ).values,
+        z_data = np.asarray(
+            z.values,
             dtype=np.float64
         )
 
-        surface_temperature = np.asarray(
-            subset[
-                surface_variable
-            ].values,
-            dtype=np.float64
+        u_data = force_81x81(
+            u_data,
+            lat_values,
+            lon_values,
+            center_lat,
+            center_lon
         )
 
-        # Remove an extra singleton dimension if necessary.
-
-        u = np.squeeze(u)
-        v = np.squeeze(v)
-        z = np.squeeze(z)
-        surface_temperature = np.squeeze(
-            surface_temperature
+        v_data = force_81x81(
+            v_data,
+            lat_values,
+            lon_values,
+            center_lat,
+            center_lon
         )
 
-        u = pad_to_81(u)
-        v = pad_to_81(v)
-        z = pad_to_81(z)
-
-        surface_temperature = np.asarray(
-            surface_temperature
-        )
-
-        # Surface field is H x W.
-
-        if surface_temperature.ndim != 2:
-
-            surface_temperature = np.squeeze(
-                surface_temperature
-            )
-
-        if (
-            surface_temperature.shape[-2:]
-            != (GRID_SIZE, GRID_SIZE)
-        ):
-
-            surface_temperature = np.pad(
-                surface_temperature,
-                (
-                    (
-                        0,
-                        max(
-                            0,
-                            GRID_SIZE
-                            - surface_temperature.shape[-2]
-                        )
-                    ),
-                    (
-                        0,
-                        max(
-                            0,
-                            GRID_SIZE
-                            - surface_temperature.shape[-1]
-                        )
-                    )
-                ),
-                mode="edge"
-            )
-
-            surface_temperature = (
-                surface_temperature[
-                    :GRID_SIZE,
-                    :GRID_SIZE
-                ]
-            )
-
-        # Standardize each channel independently.
-        u = standardize_channel(u)
-        v = standardize_channel(v)
-        z = standardize_channel(z)
-        surface_temperature = (
-            standardize_channel(
-                surface_temperature
-            )
-        )
-
-        data = np.concatenate(
-            [
-                u,
-                v,
-                z,
-                surface_temperature[
-                    np.newaxis,
-                    :, :
-                ]
-            ],
-            axis=0
-        )
-
-        if data.shape != (
-            THREE_D_CHANNELS,
-            GRID_SIZE,
-            GRID_SIZE
-        ):
-
-            raise RuntimeError(
-                "Constructed GFS tensor has shape "
-                f"{data.shape}; expected "
-                f"({THREE_D_CHANNELS}, "
-                f"{GRID_SIZE}, "
-                f"{GRID_SIZE})."
-            )
-
-        return (
-            data.astype(np.float32),
-            1.0,
-            source_url
+        z_data = force_81x81(
+            z_data,
+            lat_values,
+            lon_values,
+            center_lat,
+            center_lon
         )
 
     finally:
 
-        if ds is not None:
+        pressure_ds.close()
+
+    # --------------------------------------------------------
+    # Surface temperature
+    # --------------------------------------------------------
+
+    surface_ds = (
+        open_cfgrib_dataset(
+            grib_path,
+            {
+                "typeOfLevel":
+                    "surface",
+                "shortName":
+                    "t"
+            }
+        )
+    )
+
+    try:
+
+        surface_t = get_variable(
+            surface_ds,
+            [
+                "t",
+                "tmp"
+            ]
+        )
+
+        surface_t = (
+            surface_t.transpose(
+                "latitude",
+                "longitude"
+            )
+        )
+
+        lat_values = (
+            surface_t[
+                "latitude"
+            ].values
+        )
+
+        lon_values = (
+            surface_t[
+                "longitude"
+            ].values
+        )
+
+        surface_t_data = np.asarray(
+            surface_t.values,
+            dtype=np.float64
+        )
+
+        surface_t_data = force_81x81(
+            surface_t_data,
+            lat_values,
+            lon_values,
+            center_lat,
+            center_lon
+        )
+
+    finally:
+
+        surface_ds.close()
+
+    # --------------------------------------------------------
+    # 13 channels
+    # --------------------------------------------------------
+
+    processed = [
+
+        standardize_channel(
+            u_data[0]
+        ),
+
+        standardize_channel(
+            u_data[1]
+        ),
+
+        standardize_channel(
+            u_data[2]
+        ),
+
+        standardize_channel(
+            u_data[3]
+        ),
+
+        standardize_channel(
+            v_data[0]
+        ),
+
+        standardize_channel(
+            v_data[1]
+        ),
+
+        standardize_channel(
+            v_data[2]
+        ),
+
+        standardize_channel(
+            v_data[3]
+        ),
+
+        standardize_channel(
+            z_data[0]
+        ),
+
+        standardize_channel(
+            z_data[1]
+        ),
+
+        standardize_channel(
+            z_data[2]
+        ),
+
+        standardize_channel(
+            z_data[3]
+        ),
+
+        standardize_channel(
+            surface_t_data
+        )
+    ]
+
+    tensor = np.stack(
+        processed,
+        axis=0
+    ).astype(
+        np.float32
+    )
+
+    expected = (
+        THREE_D_CHANNELS,
+        GRID_SIZE,
+        GRID_SIZE
+    )
+
+    if tensor.shape != expected:
+
+        raise RuntimeError(
+            f"GFS tensor has shape "
+            f"{tensor.shape}; "
+            f"expected {expected}."
+        )
+
+    return tensor
+
+
+def fetch_one_3d_frame(
+    observation
+):
+
+    grib_path = None
+
+    try:
+
+        grib_path, url = (
+            download_gfs_file(
+                observation.timestamp,
+                observation.latitude,
+                observation.longitude
+            )
+        )
+
+        tensor = extract_gfs_tensor(
+            grib_path,
+            observation.latitude,
+            normalize_longitude(
+                observation.longitude
+            )
+        )
+
+        return (
+            tensor,
+            1.0,
+            url
+        )
+
+    finally:
+
+        if grib_path is not None:
 
             try:
-                ds.close()
 
-            except Exception:
+                os.remove(
+                    grib_path
+                )
+
+            except OSError:
+
                 pass
 
 
 # ============================================================
-# BUILD ENVIRONMENT INPUT
+# INPUT CONSTRUCTION
 # ============================================================
 
-def build_environment(
+def build_track_array(
     observations
 ):
 
-    vectors = []
-
-    for index in range(
-        INPUT_STEPS
-    ):
-
-        vectors.append(
-            build_environment_vector(
-                observations,
-                index
-            )
-        )
-
-    env = np.asarray(
-        vectors,
-        dtype=np.float64
-    )
-
-    if env.shape != (
-        INPUT_STEPS,
-        ENV_FEATURES
-    ):
-
-        raise RuntimeError(
-            f"Environment shape is "
-            f"{env.shape}; expected "
-            f"({INPUT_STEPS}, "
-            f"{ENV_FEATURES})."
-        )
-
-    return env
-
-
-# ============================================================
-# BUILD 3D INPUT
-# ============================================================
-
-def build_3d_input(
-    observations
-):
-
-    frames = []
-    masks = []
-
-    sources = []
-
-    for observation in observations:
-
-        try:
-
-            frame, mask, source = (
-                get_gfs_3d(
-                    observation.timestamp,
-                    observation.latitude,
-                    observation.longitude
-                )
-            )
-
-            frames.append(
-                frame
-            )
-
-            masks.append(
-                mask
-            )
-
-            sources.append(
-                source
-            )
-
-        except Exception as e:
-
-            print(
-                "GFS error for",
-                observation.timestamp,
-                ":",
-                e
-            )
-
-            # Same missing-frame convention
-            # used during TCND training.
-
-            frames.append(
-                np.zeros(
-                    (
-                        THREE_D_CHANNELS,
-                        GRID_SIZE,
-                        GRID_SIZE
-                    ),
-                    dtype=np.float32
-                )
-            )
-
-            masks.append(
-                0.0
-            )
-
-            sources.append(
-                None
-            )
-
-    return (
-        np.stack(
-            frames,
-            axis=0
-        ),
-        np.asarray(
-            masks,
-            dtype=np.float32
-        ),
-        sources
-    )
-
-
-# ============================================================
-# PREDICTION
-# ============================================================
-
-def run_prediction(
-    observations
-):
-
-    # --------------------------------------------------------
-    # Track
-    # --------------------------------------------------------
-
-    track = np.asarray(
+    return np.asarray(
         [
             [
                 observation.longitude,
@@ -1873,50 +2059,176 @@ def run_prediction(
         dtype=np.float64
     )
 
-    # --------------------------------------------------------
-    # Environment
-    # --------------------------------------------------------
 
-    env = build_environment(
+def build_environment_array(
+    observations
+):
+
+    return np.asarray(
+        [
+            build_environment_vector(
+                observations,
+                i
+            )
+            for i in range(
+                INPUT_STEPS
+            )
+        ],
+        dtype=np.float64
+    )
+
+
+def build_3d_array(
+    observations
+):
+
+    frames = []
+    mask = []
+    source_urls = []
+    failures = []
+
+    for observation in observations:
+
+        try:
+
+            frame, frame_mask, source_url = (
+                fetch_one_3d_frame(
+                    observation
+                )
+            )
+
+            frames.append(
+                frame
+            )
+
+            mask.append(
+                frame_mask
+            )
+
+            source_urls.append(
+                source_url
+            )
+
+        except Exception as exc:
+
+            print(
+                "GFS error for "
+                f"{observation.timestamp}: "
+                f"{exc}"
+            )
+
+            frames.append(
+                np.zeros(
+                    (
+                        THREE_D_CHANNELS,
+                        GRID_SIZE,
+                        GRID_SIZE
+                    ),
+                    dtype=np.float32
+                )
+            )
+
+            mask.append(
+                0.0
+            )
+
+            source_urls.append(
+                None
+            )
+
+            failures.append(
+                {
+                    "timestamp":
+                        observation.timestamp,
+
+                    "error":
+                        str(exc)
+                }
+            )
+
+    return (
+
+        np.stack(
+            frames,
+            axis=0
+        ),
+
+        np.asarray(
+            mask,
+            dtype=np.float32
+        ),
+
+        source_urls,
+
+        failures
+    )
+
+
+# ============================================================
+# MODEL INFERENCE
+# ============================================================
+
+def run_prediction(
+    observations
+):
+
+    track = build_track_array(
         observations
     )
 
-    # --------------------------------------------------------
-    # GFS 3D atmosphere
-    # --------------------------------------------------------
-
-    three_d, mask, sources = (
-        build_3d_input(
-            observations
-        )
+    env = build_environment_array(
+        observations
     )
 
-    # --------------------------------------------------------
-    # Scaling
-    # --------------------------------------------------------
+    (
+        three_d,
+        mask,
+        source_urls,
+        gfs_failures
+    ) = build_3d_array(
+        observations
+    )
+
+    if int(
+        np.sum(mask)
+    ) == 0:
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "NOAA GFS atmospheric data "
+                "could not be retrieved for "
+                "any of the eight observations."
+            )
+        )
 
     try:
 
-        track_scaled = scalers[
-            "track"
-        ].transform(
-            track
+        track_scaled = (
+            scalers[
+                "track"
+            ].transform(
+                track
+            )
         )
 
-        env_scaled = scalers[
-            "env"
-        ].transform(
-            env
+        env_scaled = (
+            scalers[
+                "env"
+            ].transform(
+                env
+            )
         )
 
-    except Exception as e:
+    except Exception as exc:
 
         raise HTTPException(
             status_code=500,
             detail=(
-                f"Input scaling failed: {e}"
+                f"Input scaling failed: "
+                f"{exc}"
             )
-        )
+        ) from exc
 
     track_scaled = np.nan_to_num(
         track_scaled,
@@ -1935,10 +2247,6 @@ def run_prediction(
     ).astype(
         np.float32
     )
-
-    # --------------------------------------------------------
-    # Tensors
-    # --------------------------------------------------------
 
     track_tensor = (
         torch.from_numpy(
@@ -1972,10 +2280,6 @@ def run_prediction(
         .to(DEVICE)
     )
 
-    # --------------------------------------------------------
-    # Neural network
-    # --------------------------------------------------------
-
     try:
 
         with torch.no_grad():
@@ -2004,21 +2308,20 @@ def run_prediction(
             )
         )
 
-    except Exception as e:
+    except Exception as exc:
 
         raise HTTPException(
             status_code=500,
             detail=(
-                f"Model inference failed: {e}"
+                f"Model inference failed: "
+                f"{exc}"
             )
-        )
-
-    # --------------------------------------------------------
-    # Format output
-    # --------------------------------------------------------
+        ) from exc
 
     last_timestamp = (
-        observations[-1].timestamp
+        observations[
+            -1
+        ].timestamp
     )
 
     predictions = []
@@ -2027,44 +2330,43 @@ def run_prediction(
         OUTPUT_STEPS
     ):
 
-        raw_longitude = float(
+        longitude = float(
             prediction_original[
                 i,
                 0
             ]
         )
 
-        raw_latitude = float(
+        latitude = float(
             prediction_original[
                 i,
                 1
             ]
         )
 
-        raw_pressure = float(
+        pressure = float(
             prediction_original[
                 i,
                 2
             ]
         )
 
-        raw_wind = float(
+        wind_mps = float(
             prediction_original[
                 i,
                 3
             ]
         )
 
-        # Physical sanity guards.
-
+        # Prevent physically impossible negative values.
         wind_mps = max(
             0.0,
-            raw_wind
+            wind_mps
         )
 
         pressure = max(
             0.0,
-            raw_pressure
+            pressure
         )
 
         wind_knots = (
@@ -2072,30 +2374,36 @@ def run_prediction(
             * 1.943844492
         )
 
-        forecast_time = (
+        future_dt = (
             parse_timestamp(
                 last_timestamp
             )
             + timedelta(
                 hours=6 * (i + 1)
             )
-        ).strftime(
-            "%Y%m%d%H"
         )
 
         predictions.append(
             {
-                "timestamp": forecast_time,
+                "timestamp":
+                    future_dt.strftime(
+                        "%Y%m%d%H"
+                    ),
 
-                "latitude": raw_latitude,
+                "latitude":
+                    latitude,
 
-                "longitude": raw_longitude,
+                "longitude":
+                    longitude,
 
-                "pressure_hpa": pressure,
+                "pressure_hpa":
+                    pressure,
 
-                "wind_mps": wind_mps,
+                "wind_mps":
+                    wind_mps,
 
-                "wind_knots": wind_knots
+                "wind_knots":
+                    wind_knots
             }
         )
 
@@ -2103,20 +2411,16 @@ def run_prediction(
         "last_observed_timestamp":
             last_timestamp,
 
-        "forecast_hours": [
-            6,
-            12,
-            18,
-            24
-        ],
-
-        "input_observations": 8,
+        "forecast_hours":
+            [
+                6,
+                12,
+                18,
+                24
+            ],
 
         "atmospheric_source":
             "NOAA GFS 0.25 degree",
-
-        "predictions":
-            predictions,
 
         "gfs_frames_available":
             int(
@@ -2125,13 +2429,20 @@ def run_prediction(
 
         "gfs_frames_missing":
             int(
-                8 - np.sum(mask)
-            )
+                INPUT_STEPS
+                - np.sum(mask)
+            ),
+
+        "gfs_failures":
+            gfs_failures,
+
+        "predictions":
+            predictions
     }
 
 
 # ============================================================
-# ROUTES
+# API ROUTES
 # ============================================================
 
 @app.get("/")
@@ -2139,7 +2450,7 @@ def root():
 
     return {
         "service":
-            "Cyclone Future Prediction API",
+            "Cyclone Multimodal Prediction API",
 
         "status":
             "running",
@@ -2151,13 +2462,18 @@ def root():
             model is not None,
 
         "input":
-            "8 observations spaced 6 hours apart",
+            "8 observations, exactly 6 hours apart",
 
         "wind_unit":
             "m/s",
 
         "forecast":
-            "6, 12, 18 and 24 hours"
+            [
+                6,
+                12,
+                18,
+                24
+            ]
     }
 
 
@@ -2167,15 +2483,25 @@ def health():
     if model is None:
 
         return {
-            "status": "error",
-            "model_loaded": False,
-            "error": startup_error
+            "status":
+                "error",
+
+            "model_loaded":
+                False,
+
+            "error":
+                startup_error
         }
 
     return {
-        "status": "ok",
-        "model_loaded": True,
-        "device": str(DEVICE)
+        "status":
+            "ok",
+
+        "model_loaded":
+            True,
+
+        "device":
+            str(DEVICE)
     }
 
 
@@ -2184,7 +2510,10 @@ def predict(
     request: PredictionRequest
 ):
 
-    if model is None:
+    if (
+        model is None
+        or scalers is None
+    ):
 
         raise HTTPException(
             status_code=503,
@@ -2192,13 +2521,6 @@ def predict(
                 "Model is not loaded. "
                 f"{startup_error or ''}"
             )
-        )
-
-    if scalers is None:
-
-        raise HTTPException(
-            status_code=503,
-            detail="Scalers are not loaded."
         )
 
     validate_observations(
