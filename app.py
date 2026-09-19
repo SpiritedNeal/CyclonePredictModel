@@ -34,8 +34,8 @@ GRID_SIZE = 81
 
 PRESSURE_LEVELS = [200, 500, 850, 925]
 GFS_TIMEOUT = int(os.getenv("GFS_TIMEOUT", "60"))
-GFS_MAX_WORKERS = int(os.getenv("GFS_MAX_WORKERS", "4"))
-CODE_VERSION = "2026-09-19-tcnd-aligned-v6-parallel-gfs"
+GFS_MAX_WORKERS = int(os.getenv("GFS_MAX_WORKERS", "8"))
+CODE_VERSION = "2026-09-19-tcnd-aligned-v7-fast-gfs"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -634,48 +634,38 @@ def download_gfs(timestamp: datetime, latitude: float, longitude: float):
     raise RuntimeError("NOAA GFS lookup failed; " + " | ".join(errors[:4]))
 
 
-def open_grib_field(grib_path: str, short_name: str, level_type: str, level_value: float):
-    """Open exactly one GRIB field/level using cfgrib's native GRIB filters."""
+def open_grib_group(grib_path: str, type_of_level: str):
+    """Open one GRIB group containing all variables needed at a level type.
+
+    Opening the same GRIB file once per variable/level is extremely expensive
+    because cfgrib repeatedly parses the index. We therefore open the complete
+    pressure-level group once and the 2-m group once per frame.
+    """
     backend_kwargs = {
         "indexpath": "",
         "filter_by_keys": {
-            "typeOfLevel": level_type,
-            "level": level_value,
-            "shortName": short_name,
+            "typeOfLevel": type_of_level,
         },
     }
 
     try:
-        ds = cfgrib.open_dataset(grib_path, backend_kwargs=backend_kwargs)
+        return cfgrib.open_dataset(grib_path, backend_kwargs=backend_kwargs)
     except Exception as exc:
-        raise KeyError(
-            f"Could not open GRIB field {short_name} / {level_type} / {level_value}: {exc}"
+        raise RuntimeError(
+            f"Could not open GRIB group {type_of_level}: {exc}"
         ) from exc
 
-    try:
-        if short_name == "u" and "u" in ds.data_vars:
-            return ds["u"]
-        if short_name == "v" and "v" in ds.data_vars:
-            return ds["v"]
-        if short_name == "gh" and "gh" in ds.data_vars:
-            return ds["gh"]
-        if short_name == "2t" and "t2m" in ds.data_vars:
-            return ds["t2m"]
-        if short_name == "2t" and "2t" in ds.data_vars:
-            return ds["2t"]
 
-        # Fall back to the first data variable in the filtered dataset.
-        if len(ds.data_vars) == 1:
-            return next(iter(ds.data_vars.values()))
+def get_grib_variable(ds, preferred_names):
+    """Return the first available variable from a list of GRIB/xarray names."""
+    for name in preferred_names:
+        if name in ds.data_vars:
+            return ds[name]
 
-        raise KeyError(
-            f"Filtered GRIB dataset did not contain expected variable {short_name}; "
-            f"found {list(ds.data_vars)}"
-        )
-    finally:
-        # xarray/cfgrib datasets keep file handles until closed.
-        # The returned DataArray owns the underlying dataset, so load it now.
-        pass
+    raise KeyError(
+        f"None of {preferred_names} found in GRIB dataset; "
+        f"available variables: {list(ds.data_vars)}"
+    )
 
 
 def to_2d_numpy(da) -> np.ndarray:
@@ -740,6 +730,11 @@ def resize_81x81(arr: np.ndarray) -> np.ndarray:
 
 
 def extract_gfs_tensor(grib_bytes: bytes) -> np.ndarray:
+    """Convert one filtered GFS GRIB2 payload into the 13-channel model input.
+
+    Performance-critical implementation: cfgrib is opened only twice per frame
+    rather than once for each of the 13 channels.
+    """
     with tempfile.NamedTemporaryFile(suffix=".grib2", delete=False) as tmp:
         tmp.write(grib_bytes)
         grib_path = tmp.name
@@ -747,41 +742,43 @@ def extract_gfs_tensor(grib_bytes: bytes) -> np.ndarray:
     try:
         channels = []
 
-        # Training order:
-        # 4 U + 4 V + 4 geopotential-height + 1 SST-like field.
+        # Open the entire isobaric group once. It contains U, V and GH for all
+        # four requested pressure levels.
+        pressure_ds = open_grib_group(grib_path, "isobaricInhPa")
+
         for level in PRESSURE_LEVELS:
-            da = open_grib_field(
-                grib_path, "u", "isobaricInhPa", level
-            ).load()
-            channels.append(
-                resize_81x81(standardize_channel(to_2d_numpy(da)))
+            da = pressure_ds["u"].sel(isobaricInhPa=level).load()
+            channels.append(resize_81x81(standardize_channel(to_2d_numpy(da))))
+
+        for level in PRESSURE_LEVELS:
+            da = pressure_ds["v"].sel(isobaricInhPa=level).load()
+            channels.append(resize_81x81(standardize_channel(to_2d_numpy(da))))
+
+        # cfgrib may expose geopotential height as "gh". Keep a small fallback
+        # for datasets that expose an alternate name.
+        gh_name = "gh" if "gh" in pressure_ds.data_vars else "z" if "z" in pressure_ds.data_vars else None
+        if gh_name is None:
+            raise KeyError(
+                f"GFS pressure dataset contains no geopotential-height variable; "
+                f"found {list(pressure_ds.data_vars)}"
             )
 
         for level in PRESSURE_LEVELS:
-            da = open_grib_field(
-                grib_path, "v", "isobaricInhPa", level
-            ).load()
-            channels.append(
-                resize_81x81(standardize_channel(to_2d_numpy(da)))
+            da = pressure_ds[gh_name].sel(isobaricInhPa=level).load()
+            channels.append(resize_81x81(standardize_channel(to_2d_numpy(da))))
+
+        # The model was trained with SST as channel 13. Production GFS uses
+        # 2-m temperature as the documented inference-time proxy.
+        surface_ds = open_grib_group(grib_path, "heightAboveGround")
+        temp_name = "t2m" if "t2m" in surface_ds.data_vars else "2t" if "2t" in surface_ds.data_vars else None
+        if temp_name is None:
+            raise KeyError(
+                f"GFS surface dataset contains no 2-m temperature variable; "
+                f"found {list(surface_ds.data_vars)}"
             )
 
-        for level in PRESSURE_LEVELS:
-            da = open_grib_field(
-                grib_path, "gh", "isobaricInhPa", level
-            ).load()
-            channels.append(
-                resize_81x81(standardize_channel(to_2d_numpy(da)))
-            )
-
-        # TCND training used SST as channel 13. GFS does not provide that
-        # original field through this request, so 2-m temperature is used as
-        # the explicit inference-time proxy.
-        da = open_grib_field(
-            grib_path, "2t", "heightAboveGround", 2
-        ).load()
-        channels.append(
-            resize_81x81(standardize_channel(to_2d_numpy(da)))
-        )
+        da = surface_ds[temp_name].sel(heightAboveGround=2).load()
+        channels.append(resize_81x81(standardize_channel(to_2d_numpy(da))))
 
         tensor = np.stack(channels, axis=0).astype(np.float32)
 
@@ -798,6 +795,7 @@ def extract_gfs_tensor(grib_bytes: bytes) -> np.ndarray:
             os.remove(grib_path)
         except OSError:
             pass
+
 
 def fetch_one_gfs_frame(timestamp: datetime, latitude: float, longitude: float):
     data, cycle_dt, forecast_hour = download_gfs(timestamp, latitude, longitude)
@@ -940,8 +938,8 @@ def predict(request: PredictionRequest):
         # --------------------------------------------------------
         # The old implementation fetched/decoded all 8 GFS frames serially.
         # Each frame is independent, so this could easily take 2-3 minutes.
-        # Run a small bounded worker pool instead. Four workers keeps Render
-        # memory/CPU usage reasonable while substantially reducing wall time.
+        # Run a small bounded worker pool instead. Eight workers allow all eight independent NOAA frames to be fetched/decoded concurrently.
+        # This removes the previous two-wave bottleneck when eight observations are supplied.
         gfs_started = time.perf_counter()
 
         zero_frame = np.zeros(
