@@ -32,6 +32,7 @@ GRID_SIZE = 81
 
 PRESSURE_LEVELS = [200, 500, 850, 925]
 GFS_TIMEOUT = int(os.getenv("GFS_TIMEOUT", "60"))
+CODE_VERSION = "2026-09-19-gfs-direct-field-v2"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -565,86 +566,48 @@ def download_gfs(timestamp: datetime, latitude: float, longitude: float):
     raise RuntimeError("NOAA GFS lookup failed; " + " | ".join(errors[:4]))
 
 
-def collect_cfgrib_datasets(grib_path: str):
-    # open_datasets handles the multiple GRIB message groups that result when
-    # several levels/parameters are selected from one filtered file.
-    datasets = cfgrib.open_datasets(
-        grib_path,
-        backend_kwargs={"indexpath": ""},
-    )
-    return datasets
+def open_grib_field(grib_path: str, short_name: str, level_type: str, level_value: float):
+    """Open exactly one GRIB field/level using cfgrib's native GRIB filters."""
+    backend_kwargs = {
+        "indexpath": "",
+        "filter_by_keys": {
+            "typeOfLevel": level_type,
+            "level": level_value,
+            "shortName": short_name,
+        },
+    }
 
-
-def find_field(datasets, short_name, level_type: str, level_value: float = None):
-    aliases = {short_name} if isinstance(short_name, str) else set(short_name)
-    aliases = {str(x).lower() for x in aliases}
-    candidates = []
-
-    for ds in datasets:
-        for var_name in ds.data_vars:
-            var = ds[var_name]
-            attrs = var.attrs
-            short = str(attrs.get("GRIB_shortName", var_name)).lower()
-            name = str(var_name).lower()
-            type_of_level = attrs.get("GRIB_typeOfLevel")
-            level = attrs.get("GRIB_level")
-
-            if short not in aliases and name not in aliases:
-                continue
-            if level_type is not None and type_of_level != level_type:
-                continue
-            if level_value is not None:
-                if level is None:
-                    continue
-                if abs(float(level) - float(level_value)) > 1e-6:
-                    continue
-
-            candidates.append(var)
-
-    if not candidates:
+    try:
+        ds = cfgrib.open_dataset(grib_path, backend_kwargs=backend_kwargs)
+    except Exception as exc:
         raise KeyError(
-            f"Could not find GRIB field {sorted(aliases)} / {level_type} / {level_value}"
+            f"Could not open GRIB field {short_name} / {level_type} / {level_value}: {exc}"
+        ) from exc
+
+    try:
+        if short_name == "u" and "u" in ds.data_vars:
+            return ds["u"]
+        if short_name == "v" and "v" in ds.data_vars:
+            return ds["v"]
+        if short_name == "gh" and "gh" in ds.data_vars:
+            return ds["gh"]
+        if short_name == "2t" and "t2m" in ds.data_vars:
+            return ds["t2m"]
+        if short_name == "2t" and "2t" in ds.data_vars:
+            return ds["2t"]
+
+        # Fall back to the first data variable in the filtered dataset.
+        if len(ds.data_vars) == 1:
+            return next(iter(ds.data_vars.values()))
+
+        raise KeyError(
+            f"Filtered GRIB dataset did not contain expected variable {short_name}; "
+            f"found {list(ds.data_vars)}"
         )
-
-    return candidates[0]
-
-
-def to_2d_numpy(da) -> np.ndarray:
-    arr = np.asarray(da.values, dtype=np.float32)
-
-    while arr.ndim > 2:
-        arr = arr[0]
-
-    if arr.ndim != 2:
-        raise RuntimeError(f"Expected 2D atmospheric field, got {arr.shape}")
-
-    return arr
-
-
-def resize_81x81(arr: np.ndarray) -> np.ndarray:
-    if arr.shape == (GRID_SIZE, GRID_SIZE):
-        return arr.astype(np.float32)
-
-    tensor = torch.from_numpy(arr).float().unsqueeze(0).unsqueeze(0)
-    resized = F.interpolate(
-        tensor,
-        size=(GRID_SIZE, GRID_SIZE),
-        mode="bilinear",
-        align_corners=True,
-    )
-    return resized.squeeze(0).squeeze(0).numpy().astype(np.float32)
-
-
-def standardize_channel(channel: np.ndarray) -> np.ndarray:
-    channel = np.nan_to_num(channel, nan=0.0, posinf=0.0, neginf=0.0)
-    mean = float(np.mean(channel))
-    std = float(np.std(channel))
-
-    if std < 1e-6:
-        return np.zeros_like(channel, dtype=np.float32)
-
-    standardized = (channel - mean) / std
-    return np.clip(standardized, -10.0, 10.0).astype(np.float32)
+    finally:
+        # xarray/cfgrib datasets keep file handles until closed.
+        # The returned DataArray owns the underlying dataset, so load it now.
+        pass
 
 
 def extract_gfs_tensor(grib_bytes: bytes) -> np.ndarray:
@@ -653,43 +616,50 @@ def extract_gfs_tensor(grib_bytes: bytes) -> np.ndarray:
         grib_path = tmp.name
 
     try:
-        datasets = collect_cfgrib_datasets(grib_path)
-
         channels = []
 
-        # Training order: 4 U + 4 V + 4 Z/HGT + 1 surface field.
+        # Training order:
+        # 4 U + 4 V + 4 geopotential-height + 1 SST-like field.
         for level in PRESSURE_LEVELS:
-            u = to_2d_numpy(
-                find_field(datasets, "u", "isobaricInhPa", level)
+            da = open_grib_field(
+                grib_path, "u", "isobaricInhPa", level
+            ).load()
+            channels.append(
+                resize_81x81(standardize_channel(to_2d_numpy(da)))
             )
-            channels.append(resize_81x81(standardize_channel(u)))
 
         for level in PRESSURE_LEVELS:
-            v = to_2d_numpy(
-                find_field(datasets, "v", "isobaricInhPa", level)
+            da = open_grib_field(
+                grib_path, "v", "isobaricInhPa", level
+            ).load()
+            channels.append(
+                resize_81x81(standardize_channel(to_2d_numpy(da)))
             )
-            channels.append(resize_81x81(standardize_channel(v)))
 
         for level in PRESSURE_LEVELS:
-            z = to_2d_numpy(
-                find_field(datasets, "gh", "isobaricInhPa", level)
+            da = open_grib_field(
+                grib_path, "gh", "isobaricInhPa", level
+            ).load()
+            channels.append(
+                resize_81x81(standardize_channel(to_2d_numpy(da)))
             )
-            channels.append(resize_81x81(standardize_channel(z)))
 
-        # The training data's 13th channel was SST. GFS 0.25 2 m air
-        # temperature is used here as a live proxy because this endpoint
-        # otherwise lacks the original TCND SST field.
-        surface_tmp = to_2d_numpy(
-            find_field(datasets, ["t2m", "2t", "TMP"], "heightAboveGround", 2)
+        # TCND training used SST as channel 13. GFS does not provide that
+        # original field through this request, so 2-m temperature is used as
+        # the explicit inference-time proxy.
+        da = open_grib_field(
+            grib_path, "2t", "heightAboveGround", 2
+        ).load()
+        channels.append(
+            resize_81x81(standardize_channel(to_2d_numpy(da)))
         )
-        channels.append(resize_81x81(standardize_channel(surface_tmp)))
 
         tensor = np.stack(channels, axis=0).astype(np.float32)
 
-        if tensor.shape != (THREE_D_CHANNELS, GRID_SIZE, GRID_SIZE):
+        expected = (THREE_D_CHANNELS, GRID_SIZE, GRID_SIZE)
+        if tensor.shape != expected:
             raise RuntimeError(
-                f"GFS tensor shape is {tensor.shape}; expected "
-                f"({THREE_D_CHANNELS}, {GRID_SIZE}, {GRID_SIZE})"
+                f"GFS tensor shape is {tensor.shape}; expected {expected}"
             )
 
         return tensor
@@ -699,7 +669,6 @@ def extract_gfs_tensor(grib_bytes: bytes) -> np.ndarray:
             os.remove(grib_path)
         except OSError:
             pass
-
 
 def fetch_one_gfs_frame(timestamp: datetime, latitude: float, longitude: float):
     data, cycle_dt, forecast_hour = download_gfs(timestamp, latitude, longitude)
@@ -783,6 +752,7 @@ def root():
         "device": str(DEVICE),
         "endpoint": "POST /predict",
         "required_observations": INPUT_STEPS,
+        "code_version": CODE_VERSION,
     }
 
 
@@ -793,6 +763,7 @@ def health():
         "model_loaded": LOAD_ERROR is None,
         "device": str(DEVICE),
         "load_error": LOAD_ERROR,
+        "code_version": CODE_VERSION,
     }
 
     if LOAD_ERROR is None and target_scaler is not None:
@@ -865,6 +836,17 @@ def predict(request: PredictionRequest):
                         "error": f"{type(exc).__name__}: {str(exc)[:300]}",
                     }
                 )
+
+        if gfs_frames_available == 0:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "No NOAA GFS atmospheric frames could be loaded; inference was aborted.",
+                    "gfs_frames_available": 0,
+                    "gfs_frames_missing": gfs_frames_missing,
+                    "gfs_failures": gfs_failures,
+                },
+            )
 
         three_d_raw = np.stack(three_d_frames, axis=0).astype(np.float32)
         mask_array = np.asarray(mask, dtype=np.float32)
