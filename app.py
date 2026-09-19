@@ -764,8 +764,9 @@ def extract_gfs_tensor_from_file(grib_path: str) -> np.ndarray:
     """
     Fast + bounded-RAM GFS decoding.
 
-    Each frame opens the pressure group once and the surface group once,
-    rather than opening cfgrib separately for all 13 channels.
+    Each frame opens the pressure group once and eagerly loads that group once,
+    then slices the already-loaded arrays for all 12 pressure-level channels.
+    The surface group is loaded once for channel 13.
     """
     pressure_ds = None
     surface_ds = None
@@ -773,46 +774,73 @@ def extract_gfs_tensor_from_file(grib_path: str) -> np.ndarray:
     try:
         channels = []
 
-        # Pressure-level group: U, V, GH at 200/500/850/925 hPa.
-        pressure_ds = open_grib_group(grib_path, "isobaricInhPa")
+        # --------------------------------------------------------
+        # Pressure-level group
+        # --------------------------------------------------------
+        pressure_ds = open_grib_group(grib_path, "isobaricInhPa").load()
 
         u_var = get_grib_variable(pressure_ds, ["u"])
         v_var = get_grib_variable(pressure_ds, ["v"])
         gh_var = get_grib_variable(pressure_ds, ["gh", "z"])
 
         for level in PRESSURE_LEVELS:
-            arr = to_2d_numpy(u_var.sel(isobaricInhPa=level).load())
-            channels.append(resize_81x81(standardize_channel(arr)))
+            arr = np.asarray(
+                u_var.sel(isobaricInhPa=level).values,
+                dtype=np.float32,
+            )
+            channels.append(
+                resize_81x81(standardize_channel(to_2d_numpy(arr)))
+            )
             del arr
 
         for level in PRESSURE_LEVELS:
-            arr = to_2d_numpy(v_var.sel(isobaricInhPa=level).load())
-            channels.append(resize_81x81(standardize_channel(arr)))
+            arr = np.asarray(
+                v_var.sel(isobaricInhPa=level).values,
+                dtype=np.float32,
+            )
+            channels.append(
+                resize_81x81(standardize_channel(to_2d_numpy(arr)))
+            )
             del arr
 
         for level in PRESSURE_LEVELS:
-            arr = to_2d_numpy(gh_var.sel(isobaricInhPa=level).load())
-            channels.append(resize_81x81(standardize_channel(arr)))
+            arr = np.asarray(
+                gh_var.sel(isobaricInhPa=level).values,
+                dtype=np.float32,
+            )
+            channels.append(
+                resize_81x81(standardize_channel(to_2d_numpy(arr)))
+            )
             del arr
 
-        # Free the pressure group before opening the surface group.
         try:
             pressure_ds.close()
         except Exception:
             pass
         pressure_ds = None
+
         del u_var, v_var, gh_var
 
-        # Surface group: GFS 2-m temperature used as the training SST proxy.
-        surface_ds = open_grib_group(grib_path, "heightAboveGround")
+        # --------------------------------------------------------
+        # Surface group
+        # --------------------------------------------------------
+        surface_ds = open_grib_group(
+            grib_path,
+            "heightAboveGround",
+        ).load()
+
         temp_var = get_grib_variable(surface_ds, ["t2m", "2t"])
 
-        # Do not select heightAboveGround; it may be a scalar coordinate.
-        arr = to_2d_numpy(temp_var.load())
-        channels.append(resize_81x81(standardize_channel(arr)))
-        del arr, temp_var
+        # No .sel(heightAboveGround=2): this can be a scalar coordinate.
+        arr = np.asarray(temp_var.values, dtype=np.float32)
+        channels.append(
+            resize_81x81(standardize_channel(to_2d_numpy(arr)))
+        )
 
-        tensor = np.stack(channels, axis=0).astype(np.float32, copy=False)
+        tensor = np.stack(channels, axis=0).astype(
+            np.float32,
+            copy=False,
+        )
 
         expected = (THREE_D_CHANNELS, GRID_SIZE, GRID_SIZE)
         if tensor.shape != expected:
@@ -834,8 +862,6 @@ def extract_gfs_tensor_from_file(grib_path: str) -> np.ndarray:
                 surface_ds.close()
             except Exception:
                 pass
-
-        gc.collect()
 
 
 
