@@ -35,7 +35,7 @@ GRID_SIZE = 81
 PRESSURE_LEVELS = [200, 500, 850, 925]
 GFS_TIMEOUT = int(os.getenv("GFS_TIMEOUT", "60"))
 GFS_MAX_WORKERS = int(os.getenv("GFS_MAX_WORKERS", "8"))
-CODE_VERSION = "2026-09-19-tcnd-aligned-v7-fast-gfs"
+CODE_VERSION = "2026-09-19-tcnd-aligned-v8-fast-gfs-surface-fix"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -777,7 +777,12 @@ def extract_gfs_tensor(grib_bytes: bytes) -> np.ndarray:
                 f"found {list(surface_ds.data_vars)}"
             )
 
-        da = surface_ds[temp_name].sel(heightAboveGround=2).load()
+        # Some cfgrib versions expose heightAboveGround as a scalar
+        # coordinate rather than a dimension. Calling .sel() on that scalar
+        # coordinate raises: "Could not automatically create PandasIndex...".
+        # The filtered dataset already contains only the requested 2-m field,
+        # so no selection is necessary.
+        da = surface_ds[temp_name].load()
         channels.append(resize_81x81(standardize_channel(to_2d_numpy(da))))
 
         tensor = np.stack(channels, axis=0).astype(np.float32)
