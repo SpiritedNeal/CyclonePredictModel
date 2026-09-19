@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-torch
+torch==2.14.0+cpu
 numpy
 pydantic
 requests
@@ -9,3 +9,4 @@ cfgrib
 eccodes
 scikit-learn
 joblib
+--extra-index-url https://download.pytorch.org/whl/cpu
