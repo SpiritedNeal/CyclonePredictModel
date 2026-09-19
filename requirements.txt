@@ -10,3 +10,4 @@ eccodes
 scikit-learn
 joblib
 --extra-index-url https://download.pytorch.org/whl/cpu
+netCDF4
