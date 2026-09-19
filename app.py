@@ -3,6 +3,7 @@ import math
 import tempfile
 import time
 import gc
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
@@ -36,8 +37,8 @@ GRID_SIZE = 81
 PRESSURE_LEVELS = [200, 500, 850, 925]
 GFS_TIMEOUT = int(os.getenv("GFS_TIMEOUT", "60"))
 GFS_DOWNLOAD_WORKERS = int(os.getenv("GFS_DOWNLOAD_WORKERS", "8"))
-GFS_DECODE_WORKERS = int(os.getenv("GFS_DECODE_WORKERS", "3"))
-CODE_VERSION = "2026-09-19-tcnd-aligned-v11-streamed-gfs"
+GFS_DECODE_WORKERS = int(os.getenv("GFS_DECODE_WORKERS", "4"))
+CODE_VERSION = "2026-09-19-tcnd-aligned-v12-stream-overlap"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -605,7 +606,11 @@ def gfs_url(cycle_dt: datetime, forecast_hour: int, latitude: float, longitude: 
 
 
 def download_gfs_to_file(timestamp: datetime, latitude: float, longitude: float):
-    """Download one filtered GFS frame directly to disk without retaining the payload in RAM."""
+    """Stream one filtered GFS response directly to disk.
+
+    This avoids retaining the full GRIB payload in Python RAM while allowing
+    downloads and GRIB decoding to overlap.
+    """
     errors = []
 
     for cycle_dt, forecast_hour in gfs_cycle_candidates(timestamp):
@@ -657,173 +662,94 @@ def download_gfs_to_file(timestamp: datetime, latitude: float, longitude: float)
     raise RuntimeError("NOAA GFS lookup failed; " + " | ".join(errors[:4]))
 
 
-def open_grib_group(grib_path: str, type_of_level: str):
-    """Open one GRIB group containing all variables needed at a level type.
+def open_grib_field(grib_path: str, short_name: str, level_type: str, level_value: float):
+    """Open exactly one requested GRIB field/level.
 
-    Opening the same GRIB file once per variable/level is extremely expensive
-    because cfgrib repeatedly parses the index. We therefore open the complete
-    pressure-level group once and the 2-m group once per frame.
+    This intentionally keeps each cfgrib dataset small. Opening the full
+    pressure-level group is faster on a powerful machine but can consume a lot
+    of RAM when several frames are decoded concurrently.
     """
     backend_kwargs = {
         "indexpath": "",
         "filter_by_keys": {
-            "typeOfLevel": type_of_level,
+            "typeOfLevel": level_type,
+            "level": level_value,
+            "shortName": short_name,
         },
     }
 
     try:
-        return cfgrib.open_dataset(grib_path, backend_kwargs=backend_kwargs)
+        ds = cfgrib.open_dataset(grib_path, backend_kwargs=backend_kwargs)
     except Exception as exc:
         raise RuntimeError(
-            f"Could not open GRIB group {type_of_level}: {exc}"
+            f"Could not open GRIB field {short_name}/{level_type}/{level_value}: {exc}"
         ) from exc
 
-
-def get_grib_variable(ds, preferred_names):
-    """Return the first available variable from a list of GRIB/xarray names."""
-    for name in preferred_names:
-        if name in ds.data_vars:
-            return ds[name]
-
-    raise KeyError(
-        f"None of {preferred_names} found in GRIB dataset; "
-        f"available variables: {list(ds.data_vars)}"
-    )
+    return ds
 
 
-def to_2d_numpy(da) -> np.ndarray:
-    """Convert a GRIB/xarray field to a 2D float32 array."""
-    arr = np.asarray(da.values, dtype=np.float32)
-
-    # Remove singleton/time dimensions until only latitude/longitude remain.
-    while arr.ndim > 2:
-        arr = arr[0]
-
-    if arr.ndim != 2:
-        raise RuntimeError(f"Expected a 2D atmospheric field, got shape {arr.shape}")
-
-    return np.nan_to_num(
-        arr,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    ).astype(np.float32)
-
-
-def standardize_channel(channel: np.ndarray) -> np.ndarray:
-    """Standardize one atmospheric channel exactly as the inference pipeline expects."""
-    channel = np.asarray(channel, dtype=np.float32)
-    channel = np.nan_to_num(
-        channel,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    )
-
-    mean = float(np.mean(channel, dtype=np.float64))
-    std = float(np.std(channel, dtype=np.float64))
-
-    if not np.isfinite(mean):
-        mean = 0.0
-    if not np.isfinite(std) or std < 1e-8:
-        std = 1.0
-
-    standardized = (channel - mean) / std
-    return np.clip(standardized, -10.0, 10.0).astype(np.float32)
-
-
-def resize_81x81(arr: np.ndarray) -> np.ndarray:
-    """Resize a 2D atmospheric field to the model's 81x81 grid."""
-    arr = np.asarray(arr, dtype=np.float32)
-
-    if arr.ndim != 2:
-        raise RuntimeError(f"Expected a 2D field for resizing, got shape {arr.shape}")
-
-    if arr.shape == (GRID_SIZE, GRID_SIZE):
-        return arr
-
-    tensor = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
-    resized = F.interpolate(
-        tensor,
-        size=(GRID_SIZE, GRID_SIZE),
-        mode="bilinear",
-        align_corners=True,
-    )
-    return resized.squeeze(0).squeeze(0).numpy().astype(np.float32)
+def load_single_grib_field(grib_path: str, short_name: str, level_type: str, level_value: float) -> np.ndarray:
+    """Load exactly one 2-D field, then immediately close its xarray dataset."""
+    ds = None
+    try:
+        ds = open_grib_field(grib_path, short_name, level_type, level_value)
+        if short_name in ds.data_vars:
+            da = ds[short_name]
+        elif len(ds.data_vars) == 1:
+            da = next(iter(ds.data_vars.values()))
+        else:
+            raise KeyError(
+                f"Expected {short_name}; found {list(ds.data_vars)}"
+            )
+        da = da.load()
+        return to_2d_numpy(da)
+    finally:
+        if ds is not None:
+            try:
+                ds.close()
+            except Exception:
+                pass
+        gc.collect()
 
 
 def extract_gfs_tensor_from_file(grib_path: str) -> np.ndarray:
-    """Convert one filtered GFS GRIB2 file into the 13-channel model tensor.
+    """Decode one GFS file with low peak RAM.
 
-    The large cfgrib/xarray objects are kept inside this function only. Each
-    selected field is immediately converted to a small NumPy array, processed,
-    and released. The xarray datasets are explicitly closed before return.
+    Only one GRIB field is loaded into memory at a time. This is slower than
+    decoding an entire GRIB group at once, but allows multiple frames to be
+    decoded concurrently without the large RAM spike that caused Render OOM.
     """
-    pressure_ds = None
-    surface_ds = None
-
+    channels = []
     try:
-        channels = []
-
-        pressure_ds = open_grib_group(grib_path, "isobaricInhPa")
-
         for level in PRESSURE_LEVELS:
-            da = pressure_ds["u"].sel(isobaricInhPa=level).load()
-            arr = to_2d_numpy(da)
-            channels.append(resize_81x81(standardize_channel(arr)))
-            del da, arr
-
-        for level in PRESSURE_LEVELS:
-            da = pressure_ds["v"].sel(isobaricInhPa=level).load()
-            arr = to_2d_numpy(da)
-            channels.append(resize_81x81(standardize_channel(arr)))
-            del da, arr
-
-        gh_name = (
-            "gh"
-            if "gh" in pressure_ds.data_vars
-            else "z"
-            if "z" in pressure_ds.data_vars
-            else None
-        )
-        if gh_name is None:
-            raise KeyError(
-                f"GFS pressure dataset contains no geopotential-height variable; "
-                f"found {list(pressure_ds.data_vars)}"
+            arr = load_single_grib_field(
+                grib_path, "u", "isobaricInhPa", level
             )
+            channels.append(resize_81x81(standardize_channel(arr)))
+            del arr
 
         for level in PRESSURE_LEVELS:
-            da = pressure_ds[gh_name].sel(isobaricInhPa=level).load()
-            arr = to_2d_numpy(da)
-            channels.append(resize_81x81(standardize_channel(arr)))
-            del da, arr
-
-        pressure_ds.close()
-        pressure_ds = None
-        gc.collect()
-
-        surface_ds = open_grib_group(grib_path, "heightAboveGround")
-        temp_name = (
-            "t2m"
-            if "t2m" in surface_ds.data_vars
-            else "2t"
-            if "2t" in surface_ds.data_vars
-            else None
-        )
-        if temp_name is None:
-            raise KeyError(
-                f"GFS surface dataset contains no 2-m temperature variable; "
-                f"found {list(surface_ds.data_vars)}"
+            arr = load_single_grib_field(
+                grib_path, "v", "isobaricInhPa", level
             )
+            channels.append(resize_81x81(standardize_channel(arr)))
+            del arr
 
-        da = surface_ds[temp_name].load()
-        arr = to_2d_numpy(da)
+        for level in PRESSURE_LEVELS:
+            arr = load_single_grib_field(
+                grib_path, "gh", "isobaricInhPa", level
+            )
+            channels.append(resize_81x81(standardize_channel(arr)))
+            del arr
+
+        # Training used SST as channel 13. Current inference uses GFS 2-m
+        # temperature as the documented proxy. The filtered dataset contains
+        # only this requested surface field, so no height selection is needed.
+        arr = load_single_grib_field(
+            grib_path, "2t", "heightAboveGround", 2
+        )
         channels.append(resize_81x81(standardize_channel(arr)))
-        del da, arr
-
-        surface_ds.close()
-        surface_ds = None
-        gc.collect()
+        del arr
 
         tensor = np.stack(channels, axis=0).astype(np.float32, copy=False)
         expected = (THREE_D_CHANNELS, GRID_SIZE, GRID_SIZE)
@@ -832,26 +758,9 @@ def extract_gfs_tensor_from_file(grib_path: str) -> np.ndarray:
                 f"GFS tensor shape is {tensor.shape}; expected {expected}"
             )
         return tensor
-
     finally:
-        if pressure_ds is not None:
-            try:
-                pressure_ds.close()
-            except Exception:
-                pass
-        if surface_ds is not None:
-            try:
-                surface_ds.close()
-            except Exception:
-                pass
+        channels.clear()
         gc.collect()
-
-def download_one_gfs_frame(index: int, obs):
-    ts = parse_timestamp(obs.timestamp)
-    path, cycle_dt, forecast_hour = download_gfs_to_file(
-        ts, float(obs.latitude), float(obs.longitude)
-    )
-    return index, path, cycle_dt, forecast_hour
 
 
 def decode_one_gfs_frame(index: int, path: str, cycle_dt: datetime, forecast_hour: int):
@@ -865,6 +774,36 @@ def decode_one_gfs_frame(index: int, path: str, cycle_dt: datetime, forecast_hou
             os.remove(path)
         except OSError:
             pass
+        gc.collect()
+
+
+def download_one_gfs_frame(index: int, obs):
+    ts = parse_timestamp(obs.timestamp)
+    path, cycle_dt, forecast_hour = download_gfs_to_file(
+        ts, float(obs.latitude), float(obs.longitude)
+    )
+    return index, path, cycle_dt, forecast_hour
+
+
+def fetch_and_decode_one_gfs_frame(index: int, obs, decode_semaphore):
+    """Download immediately, then decode as soon as a decoder slot is free."""
+    path = None
+    try:
+        index, path, cycle_dt, forecast_hour = download_one_gfs_frame(index, obs)
+        with decode_semaphore:
+            idx, tensor, cycle_dt, forecast_hour, error = decode_one_gfs_frame(
+                index, path, cycle_dt, forecast_hour
+            )
+            path = None
+            return idx, tensor, cycle_dt, forecast_hour, error
+    except Exception as exc:
+        if path is not None:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return index, None, None, None, f"{type(exc).__name__}: {exc}"
+    finally:
         gc.collect()
 
 
@@ -999,41 +938,55 @@ def predict(request: PredictionRequest):
         env_scaled = env_scaler.transform(env_raw).astype(np.float32)
 
         # --------------------------------------------------------
+        # --------------------------------------------------------
         # 3. Atmospheric inputs from NOAA GFS
         # --------------------------------------------------------
-        # Each GFS frame is independent, but cfgrib/xarray decoding can use a
-        # substantial amount of RAM. Keep concurrency deliberately bounded so
-        # multiple GRIB decoders do not exhaust Render's memory.
+        # Keep network concurrency high, but bound the memory-heavy GRIB
+        # decoding. Downloads and decoding overlap instead of running in two
+        # completely separate phases.
         gfs_started = time.perf_counter()
 
         zero_frame = np.zeros(
             (THREE_D_CHANNELS, GRID_SIZE, GRID_SIZE),
             dtype=np.float32,
         )
-
         three_d_frames = [zero_frame.copy() for _ in observations]
         mask = [0.0] * len(observations)
         gfs_failures = []
         gfs_frames_available = 0
         gfs_frames_missing = 0
 
-        # Phase 1: stream all downloads concurrently to disk. The GRIB payloads
-        # never accumulate in Python RAM.
         download_worker_count = max(1, min(GFS_DOWNLOAD_WORKERS, len(observations)))
-        downloaded = []
+        decode_worker_count = max(1, min(GFS_DECODE_WORKERS, len(observations)))
+        decode_semaphore = threading.Semaphore(decode_worker_count)
 
         with ThreadPoolExecutor(max_workers=download_worker_count) as executor:
             futures = {
-                executor.submit(download_one_gfs_frame, i, obs): i
+                executor.submit(fetch_and_decode_one_gfs_frame, i, obs, decode_semaphore): i
                 for i, obs in enumerate(observations)
             }
 
             for future in as_completed(futures):
                 index = futures[future]
                 obs = observations[index]
+
                 try:
-                    item = future.result()
-                    downloaded.append(item)
+                    _, frame, cycle_dt, forecast_hour, error = future.result()
+                    if error is not None or frame is None:
+                        gfs_frames_missing += 1
+                        gfs_failures.append({
+                            "timestamp": obs.timestamp,
+                            "error": error or "GFS decode failed",
+                        })
+                        continue
+
+                    three_d_frames[index] = frame
+                    mask[index] = 1.0
+                    gfs_frames_available += 1
+                    print(
+                        f"GFS frame {index + 1}/{len(observations)} loaded for "
+                        f"{obs.timestamp} using {cycle_dt.strftime('%Y%m%d%H')} f{forecast_hour:03d}"
+                    )
                 except Exception as exc:
                     gfs_frames_missing += 1
                     gfs_failures.append({
@@ -1041,45 +994,6 @@ def predict(request: PredictionRequest):
                         "error": f"{type(exc).__name__}: {str(exc)[:300]}",
                     })
 
-        # Phase 2: decode a small number of GRIB files concurrently. This is the
-        # memory-heavy step, so keep it independently bounded from downloads.
-        decode_worker_count = max(1, min(GFS_DECODE_WORKERS, len(downloaded)))
-
-        if downloaded:
-            with ThreadPoolExecutor(max_workers=decode_worker_count) as executor:
-                futures = {
-                    executor.submit(decode_one_gfs_frame, *item): item[0]
-                    for item in downloaded
-                }
-
-                for future in as_completed(futures):
-                    index = futures[future]
-                    obs = observations[index]
-                    try:
-                        idx, frame, cycle_dt, forecast_hour, error = future.result()
-                        if error is not None or frame is None:
-                            gfs_frames_missing += 1
-                            gfs_failures.append({
-                                "timestamp": obs.timestamp,
-                                "error": error or "GFS decode failed",
-                            })
-                            continue
-
-                        three_d_frames[idx] = frame
-                        mask[idx] = 1.0
-                        gfs_frames_available += 1
-                        print(
-                            f"GFS frame {idx + 1}/{len(observations)} loaded for "
-                            f"{obs.timestamp} using {cycle_dt.strftime('%Y%m%d%H')} f{forecast_hour:03d}"
-                        )
-                    except Exception as exc:
-                        gfs_frames_missing += 1
-                        gfs_failures.append({
-                            "timestamp": obs.timestamp,
-                            "error": f"{type(exc).__name__}: {str(exc)[:300]}",
-                        })
-
-        del downloaded
         gc.collect()
 
         gfs_elapsed_seconds = round(time.perf_counter() - gfs_started, 2)
@@ -1158,7 +1072,6 @@ def predict(request: PredictionRequest):
                 "total_elapsed_seconds": total_elapsed_seconds,
                 "gfs_download_workers": download_worker_count,
                 "gfs_decode_workers": decode_worker_count,
-                "memory_mode": "bounded GRIB decoding",
             },
             "output_units": {
                 "longitude": "degrees",
