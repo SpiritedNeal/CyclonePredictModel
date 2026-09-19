@@ -1,6 +1,8 @@
 import os
 import math
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 
@@ -32,7 +34,8 @@ GRID_SIZE = 81
 
 PRESSURE_LEVELS = [200, 500, 850, 925]
 GFS_TIMEOUT = int(os.getenv("GFS_TIMEOUT", "60"))
-CODE_VERSION = "2026-09-19-tcnd-aligned-v5"
+GFS_MAX_WORKERS = int(os.getenv("GFS_MAX_WORKERS", "4"))
+CODE_VERSION = "2026-09-19-tcnd-aligned-v6-parallel-gfs"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -917,6 +920,7 @@ def predict(request: PredictionRequest):
         )
 
     observations = validate_observations(request.observations)
+    request_started = time.perf_counter()
 
     try:
         # --------------------------------------------------------
@@ -934,43 +938,67 @@ def predict(request: PredictionRequest):
         # --------------------------------------------------------
         # 3. Atmospheric inputs from NOAA GFS
         # --------------------------------------------------------
-        three_d_frames = []
-        mask = []
+        # The old implementation fetched/decoded all 8 GFS frames serially.
+        # Each frame is independent, so this could easily take 2-3 minutes.
+        # Run a small bounded worker pool instead. Four workers keeps Render
+        # memory/CPU usage reasonable while substantially reducing wall time.
+        gfs_started = time.perf_counter()
+
+        zero_frame = np.zeros(
+            (THREE_D_CHANNELS, GRID_SIZE, GRID_SIZE),
+            dtype=np.float32,
+        )
+
+        three_d_frames = [zero_frame.copy() for _ in observations]
+        mask = [0.0] * len(observations)
         gfs_failures = []
         gfs_frames_available = 0
         gfs_frames_missing = 0
 
-        for obs in observations:
+        def fetch_indexed(index, obs):
             ts = parse_timestamp(obs.timestamp)
+            frame, cycle_dt, forecast_hour = fetch_one_gfs_frame(
+                ts,
+                float(obs.latitude),
+                float(obs.longitude),
+            )
+            return index, frame, cycle_dt, forecast_hour
 
-            try:
-                frame, cycle_dt, forecast_hour = fetch_one_gfs_frame(
-                    ts,
-                    float(obs.latitude),
-                    float(obs.longitude),
-                )
-                three_d_frames.append(frame)
-                mask.append(1.0)
-                gfs_frames_available += 1
+        worker_count = max(1, min(GFS_MAX_WORKERS, len(observations)))
 
-            except Exception as exc:
-                print(
-                    f"GFS failure for {obs.timestamp}: {type(exc).__name__}: {exc}"
-                )
-                three_d_frames.append(
-                    np.zeros(
-                        (THREE_D_CHANNELS, GRID_SIZE, GRID_SIZE),
-                        dtype=np.float32,
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(fetch_indexed, i, obs): i
+                for i, obs in enumerate(observations)
+            }
+
+            for future in as_completed(futures):
+                index = futures[future]
+                obs = observations[index]
+
+                try:
+                    _, frame, cycle_dt, forecast_hour = future.result()
+                    three_d_frames[index] = frame
+                    mask[index] = 1.0
+                    gfs_frames_available += 1
+                    print(
+                        f"GFS frame {index + 1}/{len(observations)} loaded for "
+                        f"{obs.timestamp} using {cycle_dt.strftime('%Y%m%d%H')} f{forecast_hour:03d}"
                     )
-                )
-                mask.append(0.0)
-                gfs_frames_missing += 1
-                gfs_failures.append(
-                    {
-                        "timestamp": obs.timestamp,
-                        "error": f"{type(exc).__name__}: {str(exc)[:300]}",
-                    }
-                )
+                except Exception as exc:
+                    print(
+                        f"GFS failure for {obs.timestamp}: {type(exc).__name__}: {exc}"
+                    )
+                    mask[index] = 0.0
+                    gfs_frames_missing += 1
+                    gfs_failures.append(
+                        {
+                            "timestamp": obs.timestamp,
+                            "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                        }
+                    )
+
+        gfs_elapsed_seconds = round(time.perf_counter() - gfs_started, 2)
 
         if gfs_frames_available == 0:
             raise HTTPException(
@@ -1035,10 +1063,17 @@ def predict(request: PredictionRequest):
                 }
             )
 
+        total_elapsed_seconds = round(time.perf_counter() - request_started, 2)
+
         return {
             "last_observed_timestamp": observations[-1].timestamp,
             "forecast_hours": forecast_hours,
             "atmospheric_source": "NOAA GFS 0.25 degree (2m temperature proxy for training SST channel)",
+            "performance": {
+                "gfs_elapsed_seconds": gfs_elapsed_seconds,
+                "total_elapsed_seconds": total_elapsed_seconds,
+                "gfs_worker_count": worker_count,
+            },
             "output_units": {
                 "longitude": "degrees",
                 "latitude": "degrees",
