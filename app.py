@@ -35,8 +35,9 @@ GRID_SIZE = 81
 
 PRESSURE_LEVELS = [200, 500, 850, 925]
 GFS_TIMEOUT = int(os.getenv("GFS_TIMEOUT", "60"))
-GFS_MAX_WORKERS = int(os.getenv("GFS_MAX_WORKERS", "2"))
-CODE_VERSION = "2026-09-19-tcnd-aligned-v9-low-memory"
+GFS_DOWNLOAD_WORKERS = int(os.getenv("GFS_DOWNLOAD_WORKERS", "8"))
+GFS_DECODE_WORKERS = int(os.getenv("GFS_DECODE_WORKERS", "3"))
+CODE_VERSION = "2026-09-19-tcnd-aligned-v11-streamed-gfs"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -603,31 +604,52 @@ def gfs_url(cycle_dt: datetime, forecast_hour: int, latitude: float, longitude: 
     return "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?" + urlencode(params)
 
 
-def download_gfs(timestamp: datetime, latitude: float, longitude: float):
+def download_gfs_to_file(timestamp: datetime, latitude: float, longitude: float):
+    """Download one filtered GFS frame directly to disk without retaining the payload in RAM."""
     errors = []
 
     for cycle_dt, forecast_hour in gfs_cycle_candidates(timestamp):
         url = gfs_url(cycle_dt, forecast_hour, latitude, longitude)
+        temp_path = None
         try:
-            response = requests.get(url, timeout=GFS_TIMEOUT)
+            with requests.get(
+                url,
+                timeout=GFS_TIMEOUT,
+                stream=True,
+                headers={"User-Agent": "CycloneForecastAPI/1.0"},
+            ) as response:
+                if response.status_code != 200:
+                    errors.append(
+                        f"{cycle_dt.strftime('%Y%m%d%H')} f{forecast_hour:03d}: HTTP {response.status_code}"
+                    )
+                    continue
 
-            if response.status_code != 200:
-                errors.append(
-                    f"{cycle_dt.strftime('%Y%m%d%H')} f{forecast_hour:03d}: HTTP {response.status_code}"
-                )
-                continue
+                content_type = response.headers.get("content-type", "").lower()
+                first_chunk = b""
 
-            content = response.content
-            content_type = response.headers.get("content-type", "").lower()
-            if not content or b"<html" in content[:300].lower() or "text/html" in content_type:
-                errors.append(
-                    f"{cycle_dt.strftime('%Y%m%d%H')} f{forecast_hour:03d}: non-GRIB response"
-                )
-                continue
+                with tempfile.NamedTemporaryFile(suffix=".grib2", delete=False) as tmp:
+                    temp_path = tmp.name
+                    for chunk in response.iter_content(chunk_size=256 * 1024):
+                        if not chunk:
+                            continue
+                        if not first_chunk:
+                            first_chunk = chunk[:512]
+                        tmp.write(chunk)
 
-            return content, cycle_dt, forecast_hour
+                if not os.path.getsize(temp_path):
+                    raise RuntimeError("empty GFS response")
+
+                if b"<html" in first_chunk.lower() or "text/html" in content_type:
+                    raise RuntimeError("non-GRIB response")
+
+                return temp_path, cycle_dt, forecast_hour
 
         except Exception as exc:
+            if temp_path is not None:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
             errors.append(
                 f"{cycle_dt.strftime('%Y%m%d%H')} f{forecast_hour:03d}: {type(exc).__name__}: {exc}"
             )
@@ -730,48 +752,33 @@ def resize_81x81(arr: np.ndarray) -> np.ndarray:
     return resized.squeeze(0).squeeze(0).numpy().astype(np.float32)
 
 
-def extract_gfs_tensor(grib_bytes: bytes) -> np.ndarray:
-    """Convert one filtered GFS GRIB2 payload into the 13-channel model input.
+def extract_gfs_tensor_from_file(grib_path: str) -> np.ndarray:
+    """Convert one filtered GFS GRIB2 file into the 13-channel model tensor.
 
-    Memory-safe implementation:
-    - cfgrib opens each GRIB group only once per frame.
-    - Only one or two frames are decoded concurrently (controlled by
-      GFS_MAX_WORKERS, default 2).
-    - xarray/cfgrib datasets are explicitly closed after all required arrays
-      have been copied into the final small NumPy tensor.
+    The large cfgrib/xarray objects are kept inside this function only. Each
+    selected field is immediately converted to a small NumPy array, processed,
+    and released. The xarray datasets are explicitly closed before return.
     """
-    with tempfile.NamedTemporaryFile(suffix=".grib2", delete=False) as tmp:
-        tmp.write(grib_bytes)
-        grib_path = tmp.name
-
     pressure_ds = None
     surface_ds = None
 
     try:
         channels = []
 
-        # Open the entire isobaric group once. It contains U, V and GH for all
-        # four requested pressure levels.
         pressure_ds = open_grib_group(grib_path, "isobaricInhPa")
 
         for level in PRESSURE_LEVELS:
             da = pressure_ds["u"].sel(isobaricInhPa=level).load()
             arr = to_2d_numpy(da)
-            channels.append(
-                resize_81x81(standardize_channel(arr))
-            )
+            channels.append(resize_81x81(standardize_channel(arr)))
             del da, arr
 
         for level in PRESSURE_LEVELS:
             da = pressure_ds["v"].sel(isobaricInhPa=level).load()
             arr = to_2d_numpy(da)
-            channels.append(
-                resize_81x81(standardize_channel(arr))
-            )
+            channels.append(resize_81x81(standardize_channel(arr)))
             del da, arr
 
-        # cfgrib may expose geopotential height as "gh". Keep a small fallback
-        # for datasets that expose an alternate name.
         gh_name = (
             "gh"
             if "gh" in pressure_ds.data_vars
@@ -779,7 +786,6 @@ def extract_gfs_tensor(grib_bytes: bytes) -> np.ndarray:
             if "z" in pressure_ds.data_vars
             else None
         )
-
         if gh_name is None:
             raise KeyError(
                 f"GFS pressure dataset contains no geopotential-height variable; "
@@ -789,20 +795,14 @@ def extract_gfs_tensor(grib_bytes: bytes) -> np.ndarray:
         for level in PRESSURE_LEVELS:
             da = pressure_ds[gh_name].sel(isobaricInhPa=level).load()
             arr = to_2d_numpy(da)
-            channels.append(
-                resize_81x81(standardize_channel(arr))
-            )
+            channels.append(resize_81x81(standardize_channel(arr)))
             del da, arr
 
-        # We no longer need the large pressure-level xarray dataset.
         pressure_ds.close()
         pressure_ds = None
         gc.collect()
 
-        # The model was trained with SST as channel 13. Production GFS uses
-        # 2-m temperature as the documented inference-time proxy.
         surface_ds = open_grib_group(grib_path, "heightAboveGround")
-
         temp_name = (
             "t2m"
             if "t2m" in surface_ds.data_vars
@@ -810,67 +810,62 @@ def extract_gfs_tensor(grib_bytes: bytes) -> np.ndarray:
             if "2t" in surface_ds.data_vars
             else None
         )
-
         if temp_name is None:
             raise KeyError(
                 f"GFS surface dataset contains no 2-m temperature variable; "
                 f"found {list(surface_ds.data_vars)}"
             )
 
-        # Some cfgrib versions expose heightAboveGround as a scalar coordinate
-        # rather than a dimension. The filtered dataset already contains only
-        # the requested 2-m field, so no selection is necessary.
         da = surface_ds[temp_name].load()
         arr = to_2d_numpy(da)
-        channels.append(
-            resize_81x81(standardize_channel(arr))
-        )
+        channels.append(resize_81x81(standardize_channel(arr)))
         del da, arr
 
-        # Release the surface xarray/cfgrib dataset before constructing the
-        # final tensor.
         surface_ds.close()
         surface_ds = None
         gc.collect()
 
         tensor = np.stack(channels, axis=0).astype(np.float32, copy=False)
-
         expected = (THREE_D_CHANNELS, GRID_SIZE, GRID_SIZE)
         if tensor.shape != expected:
             raise RuntimeError(
                 f"GFS tensor shape is {tensor.shape}; expected {expected}"
             )
-
         return tensor
 
     finally:
-        # Always close open xarray/cfgrib datasets, including failure paths.
         if pressure_ds is not None:
             try:
                 pressure_ds.close()
             except Exception:
                 pass
-
         if surface_ds is not None:
             try:
                 surface_ds.close()
             except Exception:
                 pass
-
-        try:
-            os.remove(grib_path)
-        except OSError:
-            pass
-
-        # Release local references aggressively because this function is called
-        # by multiple worker threads on memory-constrained Render instances.
         gc.collect()
 
+def download_one_gfs_frame(index: int, obs):
+    ts = parse_timestamp(obs.timestamp)
+    path, cycle_dt, forecast_hour = download_gfs_to_file(
+        ts, float(obs.latitude), float(obs.longitude)
+    )
+    return index, path, cycle_dt, forecast_hour
 
-def fetch_one_gfs_frame(timestamp: datetime, latitude: float, longitude: float):
-    data, cycle_dt, forecast_hour = download_gfs(timestamp, latitude, longitude)
-    tensor = extract_gfs_tensor(data)
-    return tensor, cycle_dt, forecast_hour
+
+def decode_one_gfs_frame(index: int, path: str, cycle_dt: datetime, forecast_hour: int):
+    try:
+        tensor = extract_gfs_tensor_from_file(path)
+        return index, tensor, cycle_dt, forecast_hour, None
+    except Exception as exc:
+        return index, None, cycle_dt, forecast_hour, f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        gc.collect()
 
 
 # ============================================================
@@ -1022,48 +1017,70 @@ def predict(request: PredictionRequest):
         gfs_frames_available = 0
         gfs_frames_missing = 0
 
-        def fetch_indexed(index, obs):
-            ts = parse_timestamp(obs.timestamp)
-            frame, cycle_dt, forecast_hour = fetch_one_gfs_frame(
-                ts,
-                float(obs.latitude),
-                float(obs.longitude),
-            )
-            return index, frame, cycle_dt, forecast_hour
+        # Phase 1: stream all downloads concurrently to disk. The GRIB payloads
+        # never accumulate in Python RAM.
+        download_worker_count = max(1, min(GFS_DOWNLOAD_WORKERS, len(observations)))
+        downloaded = []
 
-        worker_count = max(1, min(GFS_MAX_WORKERS, 2, len(observations)))
-
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        with ThreadPoolExecutor(max_workers=download_worker_count) as executor:
             futures = {
-                executor.submit(fetch_indexed, i, obs): i
+                executor.submit(download_one_gfs_frame, i, obs): i
                 for i, obs in enumerate(observations)
             }
 
             for future in as_completed(futures):
                 index = futures[future]
                 obs = observations[index]
-
                 try:
-                    _, frame, cycle_dt, forecast_hour = future.result()
-                    three_d_frames[index] = frame
-                    mask[index] = 1.0
-                    gfs_frames_available += 1
-                    print(
-                        f"GFS frame {index + 1}/{len(observations)} loaded for "
-                        f"{obs.timestamp} using {cycle_dt.strftime('%Y%m%d%H')} f{forecast_hour:03d}"
-                    )
+                    item = future.result()
+                    downloaded.append(item)
                 except Exception as exc:
-                    print(
-                        f"GFS failure for {obs.timestamp}: {type(exc).__name__}: {exc}"
-                    )
-                    mask[index] = 0.0
                     gfs_frames_missing += 1
-                    gfs_failures.append(
-                        {
+                    gfs_failures.append({
+                        "timestamp": obs.timestamp,
+                        "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                    })
+
+        # Phase 2: decode a small number of GRIB files concurrently. This is the
+        # memory-heavy step, so keep it independently bounded from downloads.
+        decode_worker_count = max(1, min(GFS_DECODE_WORKERS, len(downloaded)))
+
+        if downloaded:
+            with ThreadPoolExecutor(max_workers=decode_worker_count) as executor:
+                futures = {
+                    executor.submit(decode_one_gfs_frame, *item): item[0]
+                    for item in downloaded
+                }
+
+                for future in as_completed(futures):
+                    index = futures[future]
+                    obs = observations[index]
+                    try:
+                        idx, frame, cycle_dt, forecast_hour, error = future.result()
+                        if error is not None or frame is None:
+                            gfs_frames_missing += 1
+                            gfs_failures.append({
+                                "timestamp": obs.timestamp,
+                                "error": error or "GFS decode failed",
+                            })
+                            continue
+
+                        three_d_frames[idx] = frame
+                        mask[idx] = 1.0
+                        gfs_frames_available += 1
+                        print(
+                            f"GFS frame {idx + 1}/{len(observations)} loaded for "
+                            f"{obs.timestamp} using {cycle_dt.strftime('%Y%m%d%H')} f{forecast_hour:03d}"
+                        )
+                    except Exception as exc:
+                        gfs_frames_missing += 1
+                        gfs_failures.append({
                             "timestamp": obs.timestamp,
                             "error": f"{type(exc).__name__}: {str(exc)[:300]}",
-                        }
-                    )
+                        })
+
+        del downloaded
+        gc.collect()
 
         gfs_elapsed_seconds = round(time.perf_counter() - gfs_started, 2)
 
@@ -1139,7 +1156,8 @@ def predict(request: PredictionRequest):
             "performance": {
                 "gfs_elapsed_seconds": gfs_elapsed_seconds,
                 "total_elapsed_seconds": total_elapsed_seconds,
-                "gfs_worker_count": worker_count,
+                "gfs_download_workers": download_worker_count,
+                "gfs_decode_workers": decode_worker_count,
                 "memory_mode": "bounded GRIB decoding",
             },
             "output_units": {
