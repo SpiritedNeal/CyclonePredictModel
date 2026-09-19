@@ -37,7 +37,7 @@ GRID_SIZE = 81
 PRESSURE_LEVELS = [200, 500, 850, 925]
 GFS_TIMEOUT = int(os.getenv("GFS_TIMEOUT", "60"))
 GFS_DOWNLOAD_WORKERS = int(os.getenv("GFS_DOWNLOAD_WORKERS", "8"))
-GFS_DECODE_WORKERS = int(os.getenv("GFS_DECODE_WORKERS", "4"))
+GFS_DECODE_WORKERS = int(os.getenv("GFS_DECODE_WORKERS", "3"))
 CODE_VERSION = "2026-09-19-tcnd-aligned-v12-stream-overlap"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -733,105 +733,110 @@ def resize_81x81(arr: np.ndarray) -> np.ndarray:
     )
 
 
-def open_grib_field(grib_path: str, short_name: str, level_type: str, level_value: float):
-    """Open exactly one requested GRIB field/level.
-
-    This intentionally keeps each cfgrib dataset small. Opening the full
-    pressure-level group is faster on a powerful machine but can consume a lot
-    of RAM when several frames are decoded concurrently.
-    """
+def open_grib_group(grib_path: str, type_of_level: str):
+    """Open one cfgrib/xarray group for a GFS frame."""
     backend_kwargs = {
         "indexpath": "",
         "filter_by_keys": {
-            "typeOfLevel": level_type,
-            "level": level_value,
-            "shortName": short_name,
+            "typeOfLevel": type_of_level,
         },
     }
 
     try:
-        ds = cfgrib.open_dataset(grib_path, backend_kwargs=backend_kwargs)
+        return cfgrib.open_dataset(grib_path, backend_kwargs=backend_kwargs)
     except Exception as exc:
         raise RuntimeError(
-            f"Could not open GRIB field {short_name}/{level_type}/{level_value}: {exc}"
+            f"Could not open GRIB group {type_of_level}: {exc}"
         ) from exc
 
-    return ds
 
-
-def load_single_grib_field(grib_path: str, short_name: str, level_type: str, level_value: float) -> np.ndarray:
-    """Load exactly one 2-D field, then immediately close its xarray dataset."""
-    ds = None
-    try:
-        ds = open_grib_field(grib_path, short_name, level_type, level_value)
-        if short_name in ds.data_vars:
-            da = ds[short_name]
-        elif len(ds.data_vars) == 1:
-            da = next(iter(ds.data_vars.values()))
-        else:
-            raise KeyError(
-                f"Expected {short_name}; found {list(ds.data_vars)}"
-            )
-        da = da.load()
-        return to_2d_numpy(da)
-    finally:
-        if ds is not None:
-            try:
-                ds.close()
-            except Exception:
-                pass
-        gc.collect()
+def get_grib_variable(ds, names):
+    for name in names:
+        if name in ds.data_vars:
+            return ds[name]
+    raise KeyError(
+        f"None of {names} found in GRIB dataset; "
+        f"available variables: {list(ds.data_vars)}"
+    )
 
 
 def extract_gfs_tensor_from_file(grib_path: str) -> np.ndarray:
-    """Decode one GFS file with low peak RAM.
-
-    Only one GRIB field is loaded into memory at a time. This is slower than
-    decoding an entire GRIB group at once, but allows multiple frames to be
-    decoded concurrently without the large RAM spike that caused Render OOM.
     """
-    channels = []
+    Fast + bounded-RAM GFS decoding.
+
+    Each frame opens the pressure group once and the surface group once,
+    rather than opening cfgrib separately for all 13 channels.
+    """
+    pressure_ds = None
+    surface_ds = None
+
     try:
+        channels = []
+
+        # Pressure-level group: U, V, GH at 200/500/850/925 hPa.
+        pressure_ds = open_grib_group(grib_path, "isobaricInhPa")
+
+        u_var = get_grib_variable(pressure_ds, ["u"])
+        v_var = get_grib_variable(pressure_ds, ["v"])
+        gh_var = get_grib_variable(pressure_ds, ["gh", "z"])
+
         for level in PRESSURE_LEVELS:
-            arr = load_single_grib_field(
-                grib_path, "u", "isobaricInhPa", level
-            )
+            arr = to_2d_numpy(u_var.sel(isobaricInhPa=level).load())
             channels.append(resize_81x81(standardize_channel(arr)))
             del arr
 
         for level in PRESSURE_LEVELS:
-            arr = load_single_grib_field(
-                grib_path, "v", "isobaricInhPa", level
-            )
+            arr = to_2d_numpy(v_var.sel(isobaricInhPa=level).load())
             channels.append(resize_81x81(standardize_channel(arr)))
             del arr
 
         for level in PRESSURE_LEVELS:
-            arr = load_single_grib_field(
-                grib_path, "gh", "isobaricInhPa", level
-            )
+            arr = to_2d_numpy(gh_var.sel(isobaricInhPa=level).load())
             channels.append(resize_81x81(standardize_channel(arr)))
             del arr
 
-        # Training used SST as channel 13. Current inference uses GFS 2-m
-        # temperature as the documented proxy. The filtered dataset contains
-        # only this requested surface field, so no height selection is needed.
-        arr = load_single_grib_field(
-            grib_path, "2t", "heightAboveGround", 2
-        )
+        # Free the pressure group before opening the surface group.
+        try:
+            pressure_ds.close()
+        except Exception:
+            pass
+        pressure_ds = None
+        del u_var, v_var, gh_var
+
+        # Surface group: GFS 2-m temperature used as the training SST proxy.
+        surface_ds = open_grib_group(grib_path, "heightAboveGround")
+        temp_var = get_grib_variable(surface_ds, ["t2m", "2t"])
+
+        # Do not select heightAboveGround; it may be a scalar coordinate.
+        arr = to_2d_numpy(temp_var.load())
         channels.append(resize_81x81(standardize_channel(arr)))
-        del arr
+        del arr, temp_var
 
         tensor = np.stack(channels, axis=0).astype(np.float32, copy=False)
+
         expected = (THREE_D_CHANNELS, GRID_SIZE, GRID_SIZE)
         if tensor.shape != expected:
             raise RuntimeError(
                 f"GFS tensor shape is {tensor.shape}; expected {expected}"
             )
+
         return tensor
+
     finally:
-        channels.clear()
+        if pressure_ds is not None:
+            try:
+                pressure_ds.close()
+            except Exception:
+                pass
+
+        if surface_ds is not None:
+            try:
+                surface_ds.close()
+            except Exception:
+                pass
+
         gc.collect()
+
 
 
 def decode_one_gfs_frame(index: int, path: str, cycle_dt: datetime, forecast_hour: int):
