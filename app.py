@@ -37,7 +37,7 @@ GRID_SIZE = 81
 PRESSURE_LEVELS = [200, 500, 850, 925]
 GFS_TIMEOUT = int(os.getenv("GFS_TIMEOUT", "60"))
 GFS_DOWNLOAD_WORKERS = int(os.getenv("GFS_DOWNLOAD_WORKERS", "8"))
-GFS_DECODE_WORKERS = int(os.getenv("GFS_DECODE_WORKERS", "3"))
+GFS_DECODE_WORKERS = int(os.getenv("GFS_DECODE_WORKERS", "5"))
 CODE_VERSION = "2026-09-19-tcnd-aligned-v12-stream-overlap"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -850,7 +850,8 @@ def decode_one_gfs_frame(index: int, path: str, cycle_dt: datetime, forecast_hou
             os.remove(path)
         except OSError:
             pass
-        gc.collect()
+        # Do not force a full Python GC cycle for every frame; this is on the
+        # latency-critical path. Resources are explicitly closed below.
 
 
 def download_one_gfs_frame(index: int, obs):
@@ -880,7 +881,8 @@ def fetch_and_decode_one_gfs_frame(index: int, obs, decode_semaphore):
                 pass
         return index, None, None, None, f"{type(exc).__name__}: {exc}"
     finally:
-        gc.collect()
+        # File cleanup is explicit; avoid a full GC cycle per frame.
+        pass
 
 
 # ============================================================
@@ -1070,6 +1072,8 @@ def predict(request: PredictionRequest):
                         "error": f"{type(exc).__name__}: {str(exc)[:300]}",
                     })
 
+        # One collection after the GFS phase is enough to reclaim temporary
+        # Python objects without forcing a pause after every frame.
         gc.collect()
 
         gfs_elapsed_seconds = round(time.perf_counter() - gfs_started, 2)
