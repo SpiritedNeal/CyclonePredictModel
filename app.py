@@ -662,6 +662,77 @@ def download_gfs_to_file(timestamp: datetime, latitude: float, longitude: float)
     raise RuntimeError("NOAA GFS lookup failed; " + " | ".join(errors[:4]))
 
 
+
+def to_2d_numpy(da) -> np.ndarray:
+    """Convert an xarray/cfgrib field to a 2-D float32 NumPy array."""
+    arr = np.asarray(da.values, dtype=np.float32)
+
+    # Remove singleton dimensions such as time/step when present.
+    while arr.ndim > 2:
+        arr = arr[0]
+
+    if arr.ndim != 2:
+        raise RuntimeError(
+            f"Expected a 2-D atmospheric field, got shape {arr.shape}"
+        )
+
+    return np.nan_to_num(
+        arr,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).astype(np.float32, copy=False)
+
+
+def standardize_channel(channel: np.ndarray) -> np.ndarray:
+    """Standardize and clip one atmospheric channel."""
+    channel = np.asarray(channel, dtype=np.float32)
+    channel = np.nan_to_num(
+        channel,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    mean = float(np.mean(channel, dtype=np.float64))
+    std = float(np.std(channel, dtype=np.float64))
+
+    if not np.isfinite(mean):
+        mean = 0.0
+    if not np.isfinite(std) or std < 1e-8:
+        std = 1.0
+
+    return np.clip(
+        (channel - mean) / std,
+        -10.0,
+        10.0,
+    ).astype(np.float32, copy=False)
+
+
+def resize_81x81(arr: np.ndarray) -> np.ndarray:
+    """Resize a 2-D atmospheric field to the model's 81x81 grid."""
+    arr = np.asarray(arr, dtype=np.float32)
+
+    if arr.ndim != 2:
+        raise RuntimeError(
+            f"Expected a 2-D field for resizing, got shape {arr.shape}"
+        )
+
+    if arr.shape == (GRID_SIZE, GRID_SIZE):
+        return arr
+
+    tensor = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
+    resized = F.interpolate(
+        tensor,
+        size=(GRID_SIZE, GRID_SIZE),
+        mode="bilinear",
+        align_corners=True,
+    )
+    return resized.squeeze(0).squeeze(0).numpy().astype(
+        np.float32, copy=False
+    )
+
+
 def open_grib_field(grib_path: str, short_name: str, level_type: str, level_value: float):
     """Open exactly one requested GRIB field/level.
 
