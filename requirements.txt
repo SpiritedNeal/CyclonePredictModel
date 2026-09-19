@@ -3,9 +3,9 @@ uvicorn
 torch
 numpy
 pydantic
-pandas
 requests
 xarray
 cfgrib
 eccodes
 scikit-learn
+joblib
