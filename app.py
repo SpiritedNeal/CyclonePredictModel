@@ -32,7 +32,7 @@ GRID_SIZE = 81
 
 PRESSURE_LEVELS = [200, 500, 850, 925]
 GFS_TIMEOUT = int(os.getenv("GFS_TIMEOUT", "60"))
-CODE_VERSION = "2026-09-19-gfs-direct-field-v3"
+CODE_VERSION = "2026-09-19-gfs-direct-field-v4"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -608,6 +608,47 @@ def open_grib_field(grib_path: str, short_name: str, level_type: str, level_valu
         # xarray/cfgrib datasets keep file handles until closed.
         # The returned DataArray owns the underlying dataset, so load it now.
         pass
+
+
+def to_2d_numpy(da) -> np.ndarray:
+    """Convert a GRIB/xarray field to a 2D float32 array."""
+    arr = np.asarray(da.values, dtype=np.float32)
+
+    # Remove singleton/time dimensions until only latitude/longitude remain.
+    while arr.ndim > 2:
+        arr = arr[0]
+
+    if arr.ndim != 2:
+        raise RuntimeError(f"Expected a 2D atmospheric field, got shape {arr.shape}")
+
+    return np.nan_to_num(
+        arr,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).astype(np.float32)
+
+
+def standardize_channel(channel: np.ndarray) -> np.ndarray:
+    """Standardize one atmospheric channel exactly as the inference pipeline expects."""
+    channel = np.asarray(channel, dtype=np.float32)
+    channel = np.nan_to_num(
+        channel,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    mean = float(np.mean(channel, dtype=np.float64))
+    std = float(np.std(channel, dtype=np.float64))
+
+    if not np.isfinite(mean):
+        mean = 0.0
+    if not np.isfinite(std) or std < 1e-8:
+        std = 1.0
+
+    standardized = (channel - mean) / std
+    return np.clip(standardized, -10.0, 10.0).astype(np.float32)
 
 
 def resize_81x81(arr: np.ndarray) -> np.ndarray:
