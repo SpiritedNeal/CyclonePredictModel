@@ -6,4 +6,3 @@ pydantic
 pandas
 xarray
 pydap
-sklearn
