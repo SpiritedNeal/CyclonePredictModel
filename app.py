@@ -67,6 +67,7 @@ class GridEncoder(nn.Module):
         x = x.flatten(1)
         return self.fc(x)
 
+
 class CycloneModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -165,14 +166,17 @@ def load_scalers(path: str):
 
     loaded = joblib.load(path)
 
-    if not isinstance(loaded, dict):
+    if isinstance(loaded, dict):
+        t_scaler = loaded.get("track") or loaded.get("track_scaler")
+        e_scaler = loaded.get("env") or loaded.get("env_scaler")
+        y_scaler = loaded.get("target") or loaded.get("target_scaler")
+    elif isinstance(loaded, (list, tuple)) and len(loaded) >= 3:
+        t_scaler, e_scaler, y_scaler = loaded[:3]
+    else:
         raise RuntimeError(
-            "Unsupported cyclone_scalers.pkl format."
+            "Unsupported cyclone_scalers.pkl format. Expected a dict containing "
+            "track, env and target scalers."
         )
-
-    t_scaler = loaded.get("track")
-    e_scaler = loaded.get("env")
-    y_scaler = loaded.get("target")
 
     if t_scaler is None or e_scaler is None or y_scaler is None:
         raise RuntimeError(
@@ -180,13 +184,14 @@ def load_scalers(path: str):
         )
 
     if getattr(t_scaler, "n_features_in_", TRACK_FEATURES) != TRACK_FEATURES:
-        raise RuntimeError("track scaler does not contain 4 features")
-
+        raise RuntimeError("track_scaler does not contain 4 features")
     if getattr(e_scaler, "n_features_in_", ENV_FEATURES) != ENV_FEATURES:
-        raise RuntimeError("env scaler does not contain 96 features")
-
+        raise RuntimeError("env_scaler does not contain 96 features")
     if getattr(y_scaler, "n_features_in_", TRACK_FEATURES) != TRACK_FEATURES:
-        raise RuntimeError("target scaler does not contain 4 features")
+        raise RuntimeError("target_scaler does not contain 4 features")
+
+    print("Target scaler mean:", getattr(y_scaler, "mean_", None))
+    print("Target scaler scale:", getattr(y_scaler, "scale_", None))
 
     return t_scaler, e_scaler, y_scaler
 
@@ -479,33 +484,39 @@ def build_environment_sequence(observations: List[Observation]) -> np.ndarray:
 # ============================================================
 
 
-def gfs_url(timestamp: datetime, latitude: float, longitude: float) -> str:
-    date = timestamp.strftime("%Y%m%d")
-    cycle = timestamp.strftime("%H")
+def gfs_cycle_candidates(valid_time: datetime):
+    """Return (cycle_datetime, forecast_hour) candidates newest-first."""
+    base = valid_time.replace(minute=0, second=0, microsecond=0)
+    cycle_hour = (base.hour // 6) * 6
+    cycle_dt = base.replace(hour=cycle_hour)
 
-    # GFS operational cycles are 00/06/12/18 UTC.
-    if cycle not in {"00", "06", "12", "18"}:
-        raise RuntimeError(f"Unsupported GFS cycle hour: {cycle}")
+    candidates = []
+    # The primary choice is the nominal cycle. If f000 is temporarily
+    # unavailable, fall back to the previous cycle with a +6h forecast.
+    for i in range(4):
+        cdt = cycle_dt - timedelta(hours=6 * i)
+        fhour = int((base - cdt).total_seconds() // 3600)
+        candidates.append((cdt, fhour))
+    return candidates
+
+
+def gfs_url(cycle_dt: datetime, forecast_hour: int, latitude: float, longitude: float) -> str:
+    date = cycle_dt.strftime("%Y%m%d")
+    cycle = cycle_dt.strftime("%H")
 
     lon = normalize_longitude(longitude)
-    lon0 = lon - 10.0
-    lon1 = lon + 10.0
-    lat0 = latitude - 10.0
-    lat1 = latitude + 10.0
+    lon0 = max(-180.0, lon - 10.0)
+    lon1 = min(180.0, lon + 10.0)
+    lat0 = max(-90.0, latitude - 10.0)
+    lat1 = min(90.0, latitude + 10.0)
 
-    lon0 = max(-180.0, lon0)
-    lon1 = min(180.0, lon1)
-    lat0 = max(-90.0, lat0)
-    lat1 = min(90.0, lat1)
-
-    # NOAA NOMADS GFS 0.25-degree GRIB filter.
     params = [
-        ("file", f"gfs.t{cycle}z.pgrb2.0p25.f000"),
+        ("file", f"gfs.t{cycle}z.pgrb2.0p25.f{forecast_hour:03d}"),
         ("lev_200_mb", "on"),
         ("lev_500_mb", "on"),
         ("lev_850_mb", "on"),
         ("lev_925_mb", "on"),
-        ("lev_surface", "on"),
+        ("lev_2_m_above_ground", "on"),
         ("var_HGT", "on"),
         ("var_TMP", "on"),
         ("var_UGRD", "on"),
@@ -522,23 +533,36 @@ def gfs_url(timestamp: datetime, latitude: float, longitude: float) -> str:
     return "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?" + urlencode(params)
 
 
-def download_gfs(timestamp: datetime, latitude: float, longitude: float) -> bytes:
-    url = gfs_url(timestamp, latitude, longitude)
-    response = requests.get(url, timeout=GFS_TIMEOUT)
+def download_gfs(timestamp: datetime, latitude: float, longitude: float):
+    errors = []
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"NOAA GFS returned HTTP {response.status_code}: {response.text[:300]}"
-        )
+    for cycle_dt, forecast_hour in gfs_cycle_candidates(timestamp):
+        url = gfs_url(cycle_dt, forecast_hour, latitude, longitude)
+        try:
+            response = requests.get(url, timeout=GFS_TIMEOUT)
 
-    content_type = response.headers.get("content-type", "").lower()
-    if not response.content or b"<html" in response.content[:200].lower():
-        raise RuntimeError("NOAA returned a non-GRIB response")
+            if response.status_code != 200:
+                errors.append(
+                    f"{cycle_dt.strftime('%Y%m%d%H')} f{forecast_hour:03d}: HTTP {response.status_code}"
+                )
+                continue
 
-    if "text/html" in content_type:
-        raise RuntimeError("NOAA returned HTML instead of GRIB2 data")
+            content = response.content
+            content_type = response.headers.get("content-type", "").lower()
+            if not content or b"<html" in content[:300].lower() or "text/html" in content_type:
+                errors.append(
+                    f"{cycle_dt.strftime('%Y%m%d%H')} f{forecast_hour:03d}: non-GRIB response"
+                )
+                continue
 
-    return response.content
+            return content, cycle_dt, forecast_hour
+
+        except Exception as exc:
+            errors.append(
+                f"{cycle_dt.strftime('%Y%m%d%H')} f{forecast_hour:03d}: {type(exc).__name__}: {exc}"
+            )
+
+    raise RuntimeError("NOAA GFS lookup failed; " + " | ".join(errors[:4]))
 
 
 def collect_cfgrib_datasets(grib_path: str):
@@ -551,30 +575,35 @@ def collect_cfgrib_datasets(grib_path: str):
     return datasets
 
 
-def find_field(datasets, short_name: str, level_type: str, level_value: float = None):
+def find_field(datasets, short_name, level_type: str, level_value: float = None):
+    aliases = {short_name} if isinstance(short_name, str) else set(short_name)
+    aliases = {str(x).lower() for x in aliases}
     candidates = []
 
     for ds in datasets:
         for var_name in ds.data_vars:
             var = ds[var_name]
             attrs = var.attrs
-            short = attrs.get("GRIB_shortName", var_name)
+            short = str(attrs.get("GRIB_shortName", var_name)).lower()
+            name = str(var_name).lower()
             type_of_level = attrs.get("GRIB_typeOfLevel")
             level = attrs.get("GRIB_level")
 
-            if short != short_name:
+            if short not in aliases and name not in aliases:
                 continue
             if level_type is not None and type_of_level != level_type:
                 continue
-            if level_value is not None and level is not None:
-                if float(level) != float(level_value):
+            if level_value is not None:
+                if level is None:
+                    continue
+                if abs(float(level) - float(level_value)) > 1e-6:
                     continue
 
             candidates.append(var)
 
     if not candidates:
         raise KeyError(
-            f"Could not find GRIB field {short_name} / {level_type} / {level_value}"
+            f"Could not find GRIB field {sorted(aliases)} / {level_type} / {level_value}"
         )
 
     return candidates[0]
@@ -647,10 +676,11 @@ def extract_gfs_tensor(grib_bytes: bytes) -> np.ndarray:
             )
             channels.append(resize_81x81(standardize_channel(z)))
 
-        # The training data's 13th channel was SST. GFS 0.25 operational
-        # surface TMP is used here as the live-data proxy.
+        # The training data's 13th channel was SST. GFS 0.25 2 m air
+        # temperature is used here as a live proxy because this endpoint
+        # otherwise lacks the original TCND SST field.
         surface_tmp = to_2d_numpy(
-            find_field(datasets, "2t", "heightAboveGround", 2)
+            find_field(datasets, ["t2m", "2t", "TMP"], "heightAboveGround", 2)
         )
         channels.append(resize_81x81(standardize_channel(surface_tmp)))
 
@@ -672,8 +702,9 @@ def extract_gfs_tensor(grib_bytes: bytes) -> np.ndarray:
 
 
 def fetch_one_gfs_frame(timestamp: datetime, latitude: float, longitude: float):
-    data = download_gfs(timestamp, latitude, longitude)
-    return extract_gfs_tensor(data)
+    data, cycle_dt, forecast_hour = download_gfs(timestamp, latitude, longitude)
+    tensor = extract_gfs_tensor(data)
+    return tensor, cycle_dt, forecast_hour
 
 
 # ============================================================
@@ -757,12 +788,18 @@ def root():
 
 @app.get("/health")
 def health():
-    return {
+    result = {
         "status": "healthy" if LOAD_ERROR is None else "unhealthy",
         "model_loaded": LOAD_ERROR is None,
         "device": str(DEVICE),
         "load_error": LOAD_ERROR,
     }
+
+    if LOAD_ERROR is None and target_scaler is not None:
+        result["target_scaler_mean"] = [float(x) for x in target_scaler.mean_]
+        result["target_scaler_scale"] = [float(x) for x in target_scaler.scale_]
+
+    return result
 
 
 @app.post("/predict")
@@ -801,7 +838,7 @@ def predict(request: PredictionRequest):
             ts = parse_timestamp(obs.timestamp)
 
             try:
-                frame = fetch_one_gfs_frame(
+                frame, cycle_dt, forecast_hour = fetch_one_gfs_frame(
                     ts,
                     float(obs.latitude),
                     float(obs.longitude),
@@ -857,6 +894,12 @@ def predict(request: PredictionRequest):
         # --------------------------------------------------------
         # 6. IMPORTANT: inverse-transform target outputs
         # --------------------------------------------------------
+        if pred_scaled_np.shape != (OUTPUT_STEPS, TRACK_FEATURES):
+            raise RuntimeError(
+                f"Unexpected model output shape {pred_scaled_np.shape}; "
+                f"expected ({OUTPUT_STEPS}, {TRACK_FEATURES})"
+            )
+
         pred_physical = inverse_transform_predictions(pred_scaled_np)
 
         forecast_hours = [6, 12, 18, 24]
@@ -878,7 +921,7 @@ def predict(request: PredictionRequest):
         return {
             "last_observed_timestamp": observations[-1].timestamp,
             "forecast_hours": forecast_hours,
-            "atmospheric_source": "NOAA GFS 0.25 degree",
+            "atmospheric_source": "NOAA GFS 0.25 degree (2m temperature proxy for training SST channel)",
             "gfs_frames_available": gfs_frames_available,
             "gfs_frames_missing": gfs_frames_missing,
             "gfs_failures": gfs_failures,
