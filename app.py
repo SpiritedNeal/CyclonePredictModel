@@ -2,6 +2,7 @@ import os
 import math
 import tempfile
 import time
+import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
@@ -34,9 +35,8 @@ GRID_SIZE = 81
 
 PRESSURE_LEVELS = [200, 500, 850, 925]
 GFS_TIMEOUT = int(os.getenv("GFS_TIMEOUT", "60"))
-GFS_MAX_WORKERS = int(os.getenv("GFS_MAX_WORKERS", "4"))
-GDEX_MAX_WORKERS = int(os.getenv("GDEX_MAX_WORKERS", "2"))
-CODE_VERSION = "2026-09-19-tcnd-aligned-v10-gdex-low-memory"
+GFS_MAX_WORKERS = int(os.getenv("GFS_MAX_WORKERS", "2"))
+CODE_VERSION = "2026-09-19-tcnd-aligned-v9-low-memory"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -550,18 +550,8 @@ def build_environment_sequence(observations: List[Observation]) -> np.ndarray:
 
 
 # ============================================================
-# GFS 0.25-degree data access
+# GFS 0.25-degree GRIB Filter
 # ============================================================
-
-# Recent data comes from NOAA/NOMADS. Historical data falls back to the
-# NSF NCAR GDEX NCEP GFS 0.25-degree historical archive, whose THREDDS
-# NetCDF Subset Service can return only the requested variables/region.
-# This avoids downloading the ~500 MB global GRIB2 archive files.
-
-NOMADS_MAX_AGE_HOURS = int(os.getenv("NOMADS_MAX_AGE_HOURS", "240"))
-GDEX_MIN_YEAR = int(os.getenv("GDEX_MIN_YEAR", "2015"))
-GDEX_TIMEOUT = int(os.getenv("GDEX_TIMEOUT", "60"))
-GDEX_BASE = "https://tds.gdex.ucar.edu/thredds/ncss/grid/files/g/d084001"
 
 
 def gfs_cycle_candidates(valid_time: datetime):
@@ -571,6 +561,8 @@ def gfs_cycle_candidates(valid_time: datetime):
     cycle_dt = base.replace(hour=cycle_hour)
 
     candidates = []
+    # The primary choice is the nominal cycle. If f000 is temporarily
+    # unavailable, fall back to the previous cycle with a +6h forecast.
     for i in range(4):
         cdt = cycle_dt - timedelta(hours=6 * i)
         fhour = int((base - cdt).total_seconds() // 3600)
@@ -578,27 +570,15 @@ def gfs_cycle_candidates(valid_time: datetime):
     return candidates
 
 
-def subset_bounds(latitude: float, longitude: float):
-    """Return a 20x20 degree box that produces an 81x81 0.25-degree grid."""
-    lat0 = max(-90.0, latitude - 10.0)
-    lat1 = min(90.0, latitude + 10.0)
-
-    # GFS/GDEX longitudes are 0..360 degrees east.
-    lon360 = longitude_0_360(longitude)
-    lon0 = max(0.0, lon360 - 10.0)
-    lon1 = min(360.0, lon360 + 10.0)
-
-    # Near the 0/360 seam the simple box is truncated. Keeping the result
-    # within the GDEX coordinate range is preferable to making a second
-    # wrapped request; typical cyclone tracks are nowhere near this seam.
-    return lat0, lat1, lon0, lon1
-
-
 def gfs_url(cycle_dt: datetime, forecast_hour: int, latitude: float, longitude: float) -> str:
     date = cycle_dt.strftime("%Y%m%d")
     cycle = cycle_dt.strftime("%H")
 
-    lat0, lat1, lon0, lon1 = subset_bounds(latitude, longitude)
+    lon = normalize_longitude(longitude)
+    lon0 = max(-180.0, lon - 10.0)
+    lon1 = min(180.0, lon + 10.0)
+    lat0 = max(-90.0, latitude - 10.0)
+    lat1 = min(90.0, latitude + 10.0)
 
     params = [
         ("file", f"gfs.t{cycle}z.pgrb2.0p25.f{forecast_hour:03d}"),
@@ -623,7 +603,7 @@ def gfs_url(cycle_dt: datetime, forecast_hour: int, latitude: float, longitude: 
     return "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?" + urlencode(params)
 
 
-def download_gfs_nomads(timestamp: datetime, latitude: float, longitude: float):
+def download_gfs(timestamp: datetime, latitude: float, longitude: float):
     errors = []
 
     for cycle_dt, forecast_hour in gfs_cycle_candidates(timestamp):
@@ -652,299 +632,245 @@ def download_gfs_nomads(timestamp: datetime, latitude: float, longitude: float):
                 f"{cycle_dt.strftime('%Y%m%d%H')} f{forecast_hour:03d}: {type(exc).__name__}: {exc}"
             )
 
-    raise RuntimeError("NOAA NOMADS lookup failed; " + " | ".join(errors[:4]))
+    raise RuntimeError("NOAA GFS lookup failed; " + " | ".join(errors[:4]))
 
 
-def gdex_ncss_url(cycle_dt: datetime, forecast_hour: int) -> str:
-    date = cycle_dt.strftime("%Y%m%d")
-    year = cycle_dt.strftime("%Y")
-    filename = f"gfs.0p25.{date}{cycle_dt.strftime('%H')}.f{forecast_hour:03d}.grib2"
-    return f"{GDEX_BASE}/{year}/{date}/{filename}"
+def open_grib_group(grib_path: str, type_of_level: str):
+    """Open one GRIB group containing all variables needed at a level type.
 
+    Opening the same GRIB file once per variable/level is extremely expensive
+    because cfgrib repeatedly parses the index. We therefore open the complete
+    pressure-level group once and the 2-m group once per frame.
+    """
+    backend_kwargs = {
+        "indexpath": "",
+        "filter_by_keys": {
+            "typeOfLevel": type_of_level,
+        },
+    }
 
-def _ncss_download(url: str, params: list[tuple[str, str]], timeout: int) -> bytes:
-    response = requests.get(url, params=params, timeout=timeout)
-    if response.status_code != 200:
-        body = response.text[:250].replace("\n", " ")
-        raise RuntimeError(f"GDEX NCSS HTTP {response.status_code}: {body}")
-
-    content = response.content
-    content_type = response.headers.get("content-type", "").lower()
-    if not content:
-        raise RuntimeError("GDEX NCSS returned an empty response")
-
-    # NCSS normally returns binary NetCDF. If it returns an HTML/error page,
-    # fail clearly instead of trying to parse it as NetCDF.
-    if "html" in content_type or content[:20].lower().startswith(b"<html"):
-        raise RuntimeError("GDEX NCSS returned HTML instead of NetCDF data")
-
-    return content
-
-
-def download_gdex_subset(cycle_dt: datetime, forecast_hour: int, latitude: float, longitude: float):
-    """Download one small NetCDF subset containing all required historical fields."""
-    lat0, lat1, lon0, lon1 = subset_bounds(latitude, longitude)
-    url = gdex_ncss_url(cycle_dt, forecast_hour)
-
-    # One response instead of two independent NetCDF responses. This reduces
-    # peak RAM and avoids keeping two datasets alive in each worker.
-    params = [
-        ("var", "u-component_of_wind_isobaric"),
-        ("var", "v-component_of_wind_isobaric"),
-        ("var", "Geopotential_height_isobaric"),
-        ("var", "Temperature_height_above_ground"),
-        ("north", f"{lat1:.2f}"),
-        ("south", f"{lat0:.2f}"),
-        ("west", f"{lon0:.2f}"),
-        ("east", f"{lon1:.2f}"),
-        ("accept", "netcdf"),
-    ]
-
-    return _ncss_download(url, params, GDEX_TIMEOUT)
-
-
-def _load_netcdf_from_bytes(data: bytes, prefix: str):
-    """Open an NCSS NetCDF response with netCDF4."""
     try:
-        from netCDF4 import Dataset
-    except ImportError as exc:
+        return cfgrib.open_dataset(grib_path, backend_kwargs=backend_kwargs)
+    except Exception as exc:
         raise RuntimeError(
-            "Historical GFS support requires the 'netCDF4' Python package. "
-            "Add netCDF4 to requirements.txt and redeploy."
+            f"Could not open GRIB group {type_of_level}: {exc}"
         ) from exc
 
-    tmp = tempfile.NamedTemporaryFile(suffix=f"_{prefix}.nc", delete=False)
-    try:
-        tmp.write(data)
-        tmp.flush()
-        tmp.close()
-        return Dataset(tmp.name, mode="r"), tmp.name
-    except Exception:
-        try:
-            tmp.close()
-        except Exception:
-            pass
-        try:
-            os.remove(tmp.name)
-        except OSError:
-            pass
-        raise
 
+def get_grib_variable(ds, preferred_names):
+    """Return the first available variable from a list of GRIB/xarray names."""
+    for name in preferred_names:
+        if name in ds.data_vars:
+            return ds[name]
 
-def _nc_coord_name(ds, candidates):
-    for name in candidates:
-        if name in ds.variables:
-            return name
-    raise KeyError(f"None of coordinate names {candidates} found in {list(ds.variables)}")
-
-
-def _nc_data_name(ds, candidates):
-    for name in candidates:
-        if name in ds.variables:
-            return name
-    raise KeyError(f"None of variable names {candidates} found in {list(ds.variables)}")
-
-
-def _nc_spatial_slice(ds):
-    lat_name = _nc_coord_name(ds, ["lat", "latitude"])
-    lon_name = _nc_coord_name(ds, ["lon", "longitude"])
-    lats = np.asarray(ds.variables[lat_name][:], dtype=np.float64)
-    lons = np.asarray(ds.variables[lon_name][:], dtype=np.float64)
-
-    # NCSS generally returns exactly the requested box, so use the full spatial
-    # dimensions rather than assuming a particular axis orientation.
-    return lat_name, lon_name, lats, lons
-
-
-def _read_pressure_field(ds, variable_name: str, level_hpa: int) -> np.ndarray:
-    var = ds.variables[variable_name]
-    dims = list(var.dimensions)
-
-    time_axes = [i for i, d in enumerate(dims) if d.startswith("time") or d.startswith("reftime")]
-    isobaric_axes = [i for i, d in enumerate(dims) if d.startswith("isobaric")]
-    lat_axes = [i for i, d in enumerate(dims) if d in ("lat", "latitude")]
-    lon_axes = [i for i, d in enumerate(dims) if d in ("lon", "longitude")]
-
-    if len(lat_axes) != 1 or len(lon_axes) != 1 or len(isobaric_axes) != 1:
-        raise RuntimeError(
-            f"Unexpected dimensions for {variable_name}: {dims}"
-        )
-
-    iso_dim = dims[isobaric_axes[0]]
-    levels = np.asarray(ds.variables[iso_dim][:], dtype=np.float64)
-    target_pa = float(level_hpa * 100.0)
-    level_index = int(np.argmin(np.abs(levels - target_pa)))
-    if abs(float(levels[level_index]) - target_pa) > 50.0:
-        # Some conversions expose hPa rather than Pa.
-        target_alt = float(level_hpa)
-        alt_index = int(np.argmin(np.abs(levels - target_alt)))
-        if abs(float(levels[alt_index]) - target_alt) > 1.0:
-            raise RuntimeError(
-                f"Could not locate {level_hpa} hPa in {variable_name}; levels={levels[:20]}"
-            )
-        level_index = alt_index
-
-    index = [slice(None)] * var.ndim
-    for axis in time_axes:
-        index[axis] = 0
-    index[isobaric_axes[0]] = level_index
-
-    # Spatial axes remain full because NCSS already returned the requested box.
-    arr = np.asarray(var[tuple(index)], dtype=np.float32)
-    while arr.ndim > 2:
-        arr = arr[0]
-    if arr.ndim != 2:
-        raise RuntimeError(f"Expected 2D field for {variable_name}; got {arr.shape}")
-
-    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-
-
-def _read_surface_temperature(ds) -> np.ndarray:
-    variable_name = _nc_data_name(ds, ["Temperature_height_above_ground"])
-    var = ds.variables[variable_name]
-    dims = list(var.dimensions)
-
-    time_axes = [i for i, d in enumerate(dims) if d.startswith("time") or d.startswith("reftime")]
-    height_axes = [
-        i for i, d in enumerate(dims)
-        if d.startswith("height_above_ground")
-    ]
-
-    if len(height_axes) != 1:
-        raise RuntimeError(
-            f"Unexpected dimensions for {variable_name}: {dims}"
-        )
-
-    hdim = dims[height_axes[0]]
-    heights = np.asarray(ds.variables[hdim][:], dtype=np.float64)
-    height_index = int(np.argmin(np.abs(heights - 2.0)))
-
-    index = [slice(None)] * var.ndim
-    for axis in time_axes:
-        index[axis] = 0
-    index[height_axes[0]] = height_index
-
-    arr = np.asarray(var[tuple(index)], dtype=np.float32)
-    while arr.ndim > 2:
-        arr = arr[0]
-    if arr.ndim != 2:
-        raise RuntimeError(f"Expected 2D 2-m temperature field; got {arr.shape}")
-
-    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-
-
-def extract_gdex_tensor(netcdf_bytes: bytes) -> np.ndarray:
-    """Decode one GDEX NetCDF response into the trained 13-channel tensor."""
-    ds = None
-    nc_path = None
-    try:
-        ds, nc_path = _load_netcdf_from_bytes(netcdf_bytes, "gdex")
-        channels = []
-
-        u_name = _nc_data_name(ds, ["u-component_of_wind_isobaric"])
-        v_name = _nc_data_name(ds, ["v-component_of_wind_isobaric"])
-        gh_name = _nc_data_name(ds, ["Geopotential_height_isobaric"])
-
-        for level in PRESSURE_LEVELS:
-            arr = _read_pressure_field(ds, u_name, level)
-            channels.append(resize_81x81(standardize_channel(arr)))
-
-        for level in PRESSURE_LEVELS:
-            arr = _read_pressure_field(ds, v_name, level)
-            channels.append(resize_81x81(standardize_channel(arr)))
-
-        for level in PRESSURE_LEVELS:
-            arr = _read_pressure_field(ds, gh_name, level)
-            channels.append(resize_81x81(standardize_channel(arr)))
-
-        sst_proxy = _read_surface_temperature(ds)
-        channels.append(resize_81x81(standardize_channel(sst_proxy)))
-
-        tensor = np.stack(channels, axis=0).astype(np.float32)
-        expected = (THREE_D_CHANNELS, GRID_SIZE, GRID_SIZE)
-        if tensor.shape != expected:
-            raise RuntimeError(f"GDEX tensor shape is {tensor.shape}; expected {expected}")
-        return tensor
-    finally:
-        if ds is not None:
-            try:
-                ds.close()
-            except Exception:
-                pass
-        if nc_path is not None:
-            try:
-                os.remove(nc_path)
-            except OSError:
-                pass
-
-
-def fetch_one_gdex_frame(timestamp: datetime, latitude: float, longitude: float):
-    last_error = None
-
-    if timestamp.year < GDEX_MIN_YEAR:
-        raise RuntimeError(
-            f"Historical GFS archive fallback currently supports {GDEX_MIN_YEAR}-present; "
-            f"requested timestamp is {timestamp:%Y%m%d%H}."
-        )
-
-    for cycle_dt, forecast_hour in gfs_cycle_candidates(timestamp):
-        try:
-            netcdf_bytes = download_gdex_subset(
-                cycle_dt,
-                forecast_hour,
-                latitude,
-                longitude,
-            )
-            tensor = extract_gdex_tensor(netcdf_bytes)
-            return tensor, cycle_dt, forecast_hour
-        except Exception as exc:
-            last_error = exc
-            print(
-                f"GDEX failure for {timestamp:%Y%m%d%H} using "
-                f"{cycle_dt:%Y%m%d%H} f{forecast_hour:03d}: {type(exc).__name__}: {exc}"
-            )
-
-    raise RuntimeError(
-        f"Historical GFS lookup failed for {timestamp:%Y%m%d%H}: {last_error}"
+    raise KeyError(
+        f"None of {preferred_names} found in GRIB dataset; "
+        f"available variables: {list(ds.data_vars)}"
     )
 
 
-def should_try_nomads(timestamp: datetime) -> bool:
-    """Use the fast operational route for recent timestamps."""
-    age_hours = (datetime.utcnow() - timestamp).total_seconds() / 3600.0
-    return age_hours <= NOMADS_MAX_AGE_HOURS
+def to_2d_numpy(da) -> np.ndarray:
+    """Convert a GRIB/xarray field to a 2D float32 array."""
+    arr = np.asarray(da.values, dtype=np.float32)
+
+    # Remove singleton/time dimensions until only latitude/longitude remain.
+    while arr.ndim > 2:
+        arr = arr[0]
+
+    if arr.ndim != 2:
+        raise RuntimeError(f"Expected a 2D atmospheric field, got shape {arr.shape}")
+
+    return np.nan_to_num(
+        arr,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).astype(np.float32)
+
+
+def standardize_channel(channel: np.ndarray) -> np.ndarray:
+    """Standardize one atmospheric channel exactly as the inference pipeline expects."""
+    channel = np.asarray(channel, dtype=np.float32)
+    channel = np.nan_to_num(
+        channel,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    mean = float(np.mean(channel, dtype=np.float64))
+    std = float(np.std(channel, dtype=np.float64))
+
+    if not np.isfinite(mean):
+        mean = 0.0
+    if not np.isfinite(std) or std < 1e-8:
+        std = 1.0
+
+    standardized = (channel - mean) / std
+    return np.clip(standardized, -10.0, 10.0).astype(np.float32)
+
+
+def resize_81x81(arr: np.ndarray) -> np.ndarray:
+    """Resize a 2D atmospheric field to the model's 81x81 grid."""
+    arr = np.asarray(arr, dtype=np.float32)
+
+    if arr.ndim != 2:
+        raise RuntimeError(f"Expected a 2D field for resizing, got shape {arr.shape}")
+
+    if arr.shape == (GRID_SIZE, GRID_SIZE):
+        return arr
+
+    tensor = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
+    resized = F.interpolate(
+        tensor,
+        size=(GRID_SIZE, GRID_SIZE),
+        mode="bilinear",
+        align_corners=True,
+    )
+    return resized.squeeze(0).squeeze(0).numpy().astype(np.float32)
+
+
+def extract_gfs_tensor(grib_bytes: bytes) -> np.ndarray:
+    """Convert one filtered GFS GRIB2 payload into the 13-channel model input.
+
+    Memory-safe implementation:
+    - cfgrib opens each GRIB group only once per frame.
+    - Only one or two frames are decoded concurrently (controlled by
+      GFS_MAX_WORKERS, default 2).
+    - xarray/cfgrib datasets are explicitly closed after all required arrays
+      have been copied into the final small NumPy tensor.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".grib2", delete=False) as tmp:
+        tmp.write(grib_bytes)
+        grib_path = tmp.name
+
+    pressure_ds = None
+    surface_ds = None
+
+    try:
+        channels = []
+
+        # Open the entire isobaric group once. It contains U, V and GH for all
+        # four requested pressure levels.
+        pressure_ds = open_grib_group(grib_path, "isobaricInhPa")
+
+        for level in PRESSURE_LEVELS:
+            da = pressure_ds["u"].sel(isobaricInhPa=level).load()
+            arr = to_2d_numpy(da)
+            channels.append(
+                resize_81x81(standardize_channel(arr))
+            )
+            del da, arr
+
+        for level in PRESSURE_LEVELS:
+            da = pressure_ds["v"].sel(isobaricInhPa=level).load()
+            arr = to_2d_numpy(da)
+            channels.append(
+                resize_81x81(standardize_channel(arr))
+            )
+            del da, arr
+
+        # cfgrib may expose geopotential height as "gh". Keep a small fallback
+        # for datasets that expose an alternate name.
+        gh_name = (
+            "gh"
+            if "gh" in pressure_ds.data_vars
+            else "z"
+            if "z" in pressure_ds.data_vars
+            else None
+        )
+
+        if gh_name is None:
+            raise KeyError(
+                f"GFS pressure dataset contains no geopotential-height variable; "
+                f"found {list(pressure_ds.data_vars)}"
+            )
+
+        for level in PRESSURE_LEVELS:
+            da = pressure_ds[gh_name].sel(isobaricInhPa=level).load()
+            arr = to_2d_numpy(da)
+            channels.append(
+                resize_81x81(standardize_channel(arr))
+            )
+            del da, arr
+
+        # We no longer need the large pressure-level xarray dataset.
+        pressure_ds.close()
+        pressure_ds = None
+        gc.collect()
+
+        # The model was trained with SST as channel 13. Production GFS uses
+        # 2-m temperature as the documented inference-time proxy.
+        surface_ds = open_grib_group(grib_path, "heightAboveGround")
+
+        temp_name = (
+            "t2m"
+            if "t2m" in surface_ds.data_vars
+            else "2t"
+            if "2t" in surface_ds.data_vars
+            else None
+        )
+
+        if temp_name is None:
+            raise KeyError(
+                f"GFS surface dataset contains no 2-m temperature variable; "
+                f"found {list(surface_ds.data_vars)}"
+            )
+
+        # Some cfgrib versions expose heightAboveGround as a scalar coordinate
+        # rather than a dimension. The filtered dataset already contains only
+        # the requested 2-m field, so no selection is necessary.
+        da = surface_ds[temp_name].load()
+        arr = to_2d_numpy(da)
+        channels.append(
+            resize_81x81(standardize_channel(arr))
+        )
+        del da, arr
+
+        # Release the surface xarray/cfgrib dataset before constructing the
+        # final tensor.
+        surface_ds.close()
+        surface_ds = None
+        gc.collect()
+
+        tensor = np.stack(channels, axis=0).astype(np.float32, copy=False)
+
+        expected = (THREE_D_CHANNELS, GRID_SIZE, GRID_SIZE)
+        if tensor.shape != expected:
+            raise RuntimeError(
+                f"GFS tensor shape is {tensor.shape}; expected {expected}"
+            )
+
+        return tensor
+
+    finally:
+        # Always close open xarray/cfgrib datasets, including failure paths.
+        if pressure_ds is not None:
+            try:
+                pressure_ds.close()
+            except Exception:
+                pass
+
+        if surface_ds is not None:
+            try:
+                surface_ds.close()
+            except Exception:
+                pass
+
+        try:
+            os.remove(grib_path)
+        except OSError:
+            pass
+
+        # Release local references aggressively because this function is called
+        # by multiple worker threads on memory-constrained Render instances.
+        gc.collect()
 
 
 def fetch_one_gfs_frame(timestamp: datetime, latitude: float, longitude: float):
-    """Load one frame from NOMADS or automatically fall back to GDEX."""
-    nomads_error = None
-
-    if should_try_nomads(timestamp):
-        try:
-            tensor_bytes, cycle_dt, forecast_hour = download_gfs_nomads(
-                timestamp, latitude, longitude
-            )
-            tensor = extract_gfs_tensor(tensor_bytes)
-            return tensor, cycle_dt, forecast_hour, "NOMADS"
-        except Exception as exc:
-            nomads_error = exc
-            print(
-                f"NOMADS failed for {timestamp:%Y%m%d%H}; trying GDEX fallback: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-    try:
-        tensor, cycle_dt, forecast_hour = fetch_one_gdex_frame(
-            timestamp, latitude, longitude
-        )
-        return tensor, cycle_dt, forecast_hour, "GDEX"
-    except Exception as gdex_error:
-        if nomads_error is not None:
-            raise RuntimeError(
-                f"NOMADS: {type(nomads_error).__name__}: {nomads_error}; "
-                f"GDEX: {type(gdex_error).__name__}: {gdex_error}"
-            ) from gdex_error
-        raise
+    data, cycle_dt, forecast_hour = download_gfs(timestamp, latitude, longitude)
+    tensor = extract_gfs_tensor(data)
+    return tensor, cycle_dt, forecast_hour
 
 
 # ============================================================
@@ -1080,10 +1006,9 @@ def predict(request: PredictionRequest):
         # --------------------------------------------------------
         # 3. Atmospheric inputs from NOAA GFS
         # --------------------------------------------------------
-        # The old implementation fetched/decoded all 8 GFS frames serially.
-        # Each frame is independent, so this could easily take 2-3 minutes.
-        # Run a small bounded worker pool instead. Eight workers allow all eight independent NOAA frames to be fetched/decoded concurrently.
-        # This removes the previous two-wave bottleneck when eight observations are supplied.
+        # Each GFS frame is independent, but cfgrib/xarray decoding can use a
+        # substantial amount of RAM. Keep concurrency deliberately bounded so
+        # multiple GRIB decoders do not exhaust Render's memory.
         gfs_started = time.perf_counter()
 
         zero_frame = np.zeros(
@@ -1094,29 +1019,19 @@ def predict(request: PredictionRequest):
         three_d_frames = [zero_frame.copy() for _ in observations]
         mask = [0.0] * len(observations)
         gfs_failures = []
-        gfs_sources = {"NOMADS": 0, "GDEX": 0}
         gfs_frames_available = 0
         gfs_frames_missing = 0
 
         def fetch_indexed(index, obs):
             ts = parse_timestamp(obs.timestamp)
-            frame, cycle_dt, forecast_hour, source = fetch_one_gfs_frame(
+            frame, cycle_dt, forecast_hour = fetch_one_gfs_frame(
                 ts,
                 float(obs.latitude),
                 float(obs.longitude),
             )
-            return index, frame, cycle_dt, forecast_hour, source
+            return index, frame, cycle_dt, forecast_hour
 
-        # Historical GDEX NetCDF decoding can use substantially more RAM than
-        # the live NOMADS path. Bound historical concurrency to two workers.
-        # For recent/current data, four workers are sufficient and were already
-        # fast in the working deployment.
-        any_historical = any(
-            not should_try_nomads(parse_timestamp(o.timestamp))
-            for o in observations
-        )
-        worker_limit = GDEX_MAX_WORKERS if any_historical else GFS_MAX_WORKERS
-        worker_count = max(1, min(worker_limit, len(observations)))
+        worker_count = max(1, min(GFS_MAX_WORKERS, 2, len(observations)))
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {
@@ -1129,14 +1044,13 @@ def predict(request: PredictionRequest):
                 obs = observations[index]
 
                 try:
-                    _, frame, cycle_dt, forecast_hour, source = future.result()
+                    _, frame, cycle_dt, forecast_hour = future.result()
                     three_d_frames[index] = frame
                     mask[index] = 1.0
                     gfs_frames_available += 1
-                    gfs_sources[source] = gfs_sources.get(source, 0) + 1
                     print(
                         f"GFS frame {index + 1}/{len(observations)} loaded for "
-                        f"{obs.timestamp} using {source} {cycle_dt.strftime('%Y%m%d%H')} f{forecast_hour:03d}"
+                        f"{obs.timestamp} using {cycle_dt.strftime('%Y%m%d%H')} f{forecast_hour:03d}"
                     )
                 except Exception as exc:
                     print(
@@ -1147,7 +1061,7 @@ def predict(request: PredictionRequest):
                     gfs_failures.append(
                         {
                             "timestamp": obs.timestamp,
-                            "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+                            "error": f"{type(exc).__name__}: {str(exc)[:300]}",
                         }
                     )
 
@@ -1157,7 +1071,7 @@ def predict(request: PredictionRequest):
             raise HTTPException(
                 status_code=502,
                 detail={
-                    "message": "No GFS atmospheric frames could be loaded from either NOMADS or the historical GDEX archive; inference was aborted.",
+                    "message": "No NOAA GFS atmospheric frames could be loaded; inference was aborted.",
                     "gfs_frames_available": 0,
                     "gfs_frames_missing": gfs_frames_missing,
                     "gfs_failures": gfs_failures,
@@ -1221,12 +1135,12 @@ def predict(request: PredictionRequest):
         return {
             "last_observed_timestamp": observations[-1].timestamp,
             "forecast_hours": forecast_hours,
-            "atmospheric_source": "NOAA GFS 0.25 degree via NOMADS (recent) with NSF NCAR GDEX historical fallback (2m temperature proxy for training SST channel)",
+            "atmospheric_source": "NOAA GFS 0.25 degree (2m temperature proxy for training SST channel)",
             "performance": {
                 "gfs_elapsed_seconds": gfs_elapsed_seconds,
                 "total_elapsed_seconds": total_elapsed_seconds,
                 "gfs_worker_count": worker_count,
-                "gfs_sources": gfs_sources,
+                "memory_mode": "bounded GRIB decoding",
             },
             "output_units": {
                 "longitude": "degrees",
