@@ -34,8 +34,9 @@ GRID_SIZE = 81
 
 PRESSURE_LEVELS = [200, 500, 850, 925]
 GFS_TIMEOUT = int(os.getenv("GFS_TIMEOUT", "60"))
-GFS_MAX_WORKERS = int(os.getenv("GFS_MAX_WORKERS", "8"))
-CODE_VERSION = "2026-09-19-tcnd-aligned-v9-nomads-gdex-fallback"
+GFS_MAX_WORKERS = int(os.getenv("GFS_MAX_WORKERS", "4"))
+GDEX_MAX_WORKERS = int(os.getenv("GDEX_MAX_WORKERS", "2"))
+CODE_VERSION = "2026-09-19-tcnd-aligned-v10-gdex-low-memory"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -681,27 +682,16 @@ def _ncss_download(url: str, params: list[tuple[str, str]], timeout: int) -> byt
 
 
 def download_gdex_subset(cycle_dt: datetime, forecast_hour: int, latitude: float, longitude: float):
-    """Download two small NetCDF subsets from the historical GFS archive.
-
-    One request contains all four pressure-level fields (U, V, GH), and a
-    second contains 2-m temperature. Both requests are spatially subsetted to
-    the same ~20x20 degree box used by the live NOMADS path.
-    """
+    """Download one small NetCDF subset containing all required historical fields."""
     lat0, lat1, lon0, lon1 = subset_bounds(latitude, longitude)
     url = gdex_ncss_url(cycle_dt, forecast_hour)
 
-    pressure_params = [
+    # One response instead of two independent NetCDF responses. This reduces
+    # peak RAM and avoids keeping two datasets alive in each worker.
+    params = [
         ("var", "u-component_of_wind_isobaric"),
         ("var", "v-component_of_wind_isobaric"),
         ("var", "Geopotential_height_isobaric"),
-        ("north", f"{lat1:.2f}"),
-        ("south", f"{lat0:.2f}"),
-        ("west", f"{lon0:.2f}"),
-        ("east", f"{lon1:.2f}"),
-        ("accept", "netcdf"),
-    ]
-
-    surface_params = [
         ("var", "Temperature_height_above_ground"),
         ("north", f"{lat1:.2f}"),
         ("south", f"{lat0:.2f}"),
@@ -710,13 +700,7 @@ def download_gdex_subset(cycle_dt: datetime, forecast_hour: int, latitude: float
         ("accept", "netcdf"),
     ]
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        pressure_future = executor.submit(_ncss_download, url, pressure_params, GDEX_TIMEOUT)
-        surface_future = executor.submit(_ncss_download, url, surface_params, GDEX_TIMEOUT)
-        pressure_bytes = pressure_future.result()
-        surface_bytes = surface_future.result()
-
-    return pressure_bytes, surface_bytes
+    return _ncss_download(url, params, GDEX_TIMEOUT)
 
 
 def _load_netcdf_from_bytes(data: bytes, prefix: str):
@@ -849,32 +833,31 @@ def _read_surface_temperature(ds) -> np.ndarray:
     return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
 
-def extract_gdex_tensor(pressure_bytes: bytes, surface_bytes: bytes) -> np.ndarray:
-    pressure_ds, pressure_path = _load_netcdf_from_bytes(pressure_bytes, "pressure")
-    surface_ds, surface_path = _load_netcdf_from_bytes(surface_bytes, "surface")
-
+def extract_gdex_tensor(netcdf_bytes: bytes) -> np.ndarray:
+    """Decode one GDEX NetCDF response into the trained 13-channel tensor."""
+    ds = None
+    nc_path = None
     try:
+        ds, nc_path = _load_netcdf_from_bytes(netcdf_bytes, "gdex")
         channels = []
 
-        u_name = _nc_data_name(pressure_ds, ["u-component_of_wind_isobaric"])
-        v_name = _nc_data_name(pressure_ds, ["v-component_of_wind_isobaric"])
-        gh_name = _nc_data_name(pressure_ds, ["Geopotential_height_isobaric"])
+        u_name = _nc_data_name(ds, ["u-component_of_wind_isobaric"])
+        v_name = _nc_data_name(ds, ["v-component_of_wind_isobaric"])
+        gh_name = _nc_data_name(ds, ["Geopotential_height_isobaric"])
 
         for level in PRESSURE_LEVELS:
-            arr = _read_pressure_field(pressure_ds, u_name, level)
+            arr = _read_pressure_field(ds, u_name, level)
             channels.append(resize_81x81(standardize_channel(arr)))
 
         for level in PRESSURE_LEVELS:
-            arr = _read_pressure_field(pressure_ds, v_name, level)
+            arr = _read_pressure_field(ds, v_name, level)
             channels.append(resize_81x81(standardize_channel(arr)))
 
         for level in PRESSURE_LEVELS:
-            arr = _read_pressure_field(pressure_ds, gh_name, level)
+            arr = _read_pressure_field(ds, gh_name, level)
             channels.append(resize_81x81(standardize_channel(arr)))
 
-        # Match the production convention: GFS 2-m temperature is the proxy for
-        # the training SST channel.
-        sst_proxy = _read_surface_temperature(surface_ds)
+        sst_proxy = _read_surface_temperature(ds)
         channels.append(resize_81x81(standardize_channel(sst_proxy)))
 
         tensor = np.stack(channels, axis=0).astype(np.float32)
@@ -882,19 +865,15 @@ def extract_gdex_tensor(pressure_bytes: bytes, surface_bytes: bytes) -> np.ndarr
         if tensor.shape != expected:
             raise RuntimeError(f"GDEX tensor shape is {tensor.shape}; expected {expected}")
         return tensor
-
     finally:
-        try:
-            pressure_ds.close()
-        except Exception:
-            pass
-        try:
-            surface_ds.close()
-        except Exception:
-            pass
-        for path in (pressure_path, surface_path):
+        if ds is not None:
             try:
-                os.remove(path)
+                ds.close()
+            except Exception:
+                pass
+        if nc_path is not None:
+            try:
+                os.remove(nc_path)
             except OSError:
                 pass
 
@@ -910,13 +889,13 @@ def fetch_one_gdex_frame(timestamp: datetime, latitude: float, longitude: float)
 
     for cycle_dt, forecast_hour in gfs_cycle_candidates(timestamp):
         try:
-            pressure_bytes, surface_bytes = download_gdex_subset(
+            netcdf_bytes = download_gdex_subset(
                 cycle_dt,
                 forecast_hour,
                 latitude,
                 longitude,
             )
-            tensor = extract_gdex_tensor(pressure_bytes, surface_bytes)
+            tensor = extract_gdex_tensor(netcdf_bytes)
             return tensor, cycle_dt, forecast_hour
         except Exception as exc:
             last_error = exc
@@ -1121,14 +1100,23 @@ def predict(request: PredictionRequest):
 
         def fetch_indexed(index, obs):
             ts = parse_timestamp(obs.timestamp)
-            frame, cycle_dt, forecast_hour = fetch_one_gfs_frame(
+            frame, cycle_dt, forecast_hour, source = fetch_one_gfs_frame(
                 ts,
                 float(obs.latitude),
                 float(obs.longitude),
             )
-            return index, frame, cycle_dt, forecast_hour
+            return index, frame, cycle_dt, forecast_hour, source
 
-        worker_count = max(1, min(GFS_MAX_WORKERS, len(observations)))
+        # Historical GDEX NetCDF decoding can use substantially more RAM than
+        # the live NOMADS path. Bound historical concurrency to two workers.
+        # For recent/current data, four workers are sufficient and were already
+        # fast in the working deployment.
+        any_historical = any(
+            not should_try_nomads(parse_timestamp(o.timestamp))
+            for o in observations
+        )
+        worker_limit = GDEX_MAX_WORKERS if any_historical else GFS_MAX_WORKERS
+        worker_count = max(1, min(worker_limit, len(observations)))
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {
