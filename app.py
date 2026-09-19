@@ -32,7 +32,7 @@ GRID_SIZE = 81
 
 PRESSURE_LEVELS = [200, 500, 850, 925]
 GFS_TIMEOUT = int(os.getenv("GFS_TIMEOUT", "60"))
-CODE_VERSION = "2026-09-19-gfs-direct-field-v2"
+CODE_VERSION = "2026-09-19-gfs-direct-field-v3"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -608,6 +608,26 @@ def open_grib_field(grib_path: str, short_name: str, level_type: str, level_valu
         # xarray/cfgrib datasets keep file handles until closed.
         # The returned DataArray owns the underlying dataset, so load it now.
         pass
+
+
+def resize_81x81(arr: np.ndarray) -> np.ndarray:
+    """Resize a 2D atmospheric field to the model's 81x81 grid."""
+    arr = np.asarray(arr, dtype=np.float32)
+
+    if arr.ndim != 2:
+        raise RuntimeError(f"Expected a 2D field for resizing, got shape {arr.shape}")
+
+    if arr.shape == (GRID_SIZE, GRID_SIZE):
+        return arr
+
+    tensor = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
+    resized = F.interpolate(
+        tensor,
+        size=(GRID_SIZE, GRID_SIZE),
+        mode="bilinear",
+        align_corners=True,
+    )
+    return resized.squeeze(0).squeeze(0).numpy().astype(np.float32)
 
 
 def extract_gfs_tensor(grib_bytes: bytes) -> np.ndarray:
