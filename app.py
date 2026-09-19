@@ -165,29 +165,28 @@ def load_scalers(path: str):
 
     loaded = joblib.load(path)
 
-    if isinstance(loaded, dict):
-        t_scaler = loaded.get("track_scaler")
-        e_scaler = loaded.get("env_scaler")
-        y_scaler = loaded.get("target_scaler")
-    elif isinstance(loaded, (list, tuple)) and len(loaded) >= 3:
-        t_scaler, e_scaler, y_scaler = loaded[:3]
-    else:
+    if not isinstance(loaded, dict):
         raise RuntimeError(
-            "Unsupported cyclone_scalers.pkl format. Expected a dict containing "
-            "track_scaler, env_scaler and target_scaler."
+            "Unsupported cyclone_scalers.pkl format."
         )
+
+    t_scaler = loaded.get("track")
+    e_scaler = loaded.get("env")
+    y_scaler = loaded.get("target")
 
     if t_scaler is None or e_scaler is None or y_scaler is None:
         raise RuntimeError(
-            "cyclone_scalers.pkl is missing track_scaler, env_scaler or target_scaler"
+            "cyclone_scalers.pkl is missing track, env or target scaler"
         )
 
     if getattr(t_scaler, "n_features_in_", TRACK_FEATURES) != TRACK_FEATURES:
-        raise RuntimeError("track_scaler does not contain 4 features")
+        raise RuntimeError("track scaler does not contain 4 features")
+
     if getattr(e_scaler, "n_features_in_", ENV_FEATURES) != ENV_FEATURES:
-        raise RuntimeError("env_scaler does not contain 96 features")
+        raise RuntimeError("env scaler does not contain 96 features")
+
     if getattr(y_scaler, "n_features_in_", TRACK_FEATURES) != TRACK_FEATURES:
-        raise RuntimeError("target_scaler does not contain 4 features")
+        raise RuntimeError("target scaler does not contain 4 features")
 
     return t_scaler, e_scaler, y_scaler
 
