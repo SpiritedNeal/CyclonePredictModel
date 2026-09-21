@@ -788,21 +788,18 @@ def extract_gfs_tensor_from_file(grib_path: str) -> np.ndarray:
             channels.append(
                 resize_81x81(standardize_channel(to_2d_numpy(da)))
             )
-            del arr
 
         for level in PRESSURE_LEVELS:
             da = v_var.sel(isobaricInhPa=level)
             channels.append(
                 resize_81x81(standardize_channel(to_2d_numpy(da)))
             )
-            del arr
 
         for level in PRESSURE_LEVELS:
             da = gh_var.sel(isobaricInhPa=level)
             channels.append(
                 resize_81x81(standardize_channel(to_2d_numpy(da)))
             )
-            del arr
 
         try:
             pressure_ds.close()
