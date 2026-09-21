@@ -734,9 +734,9 @@ def resize_81x81(arr: np.ndarray) -> np.ndarray:
 
 
 def open_grib_group(grib_path: str, type_of_level: str):
-    """Open one cfgrib/xarray group for a GFS frame."""
+    """Open one cfgrib/xarray group, reusing the GRIB index for this frame."""
     backend_kwargs = {
-        "indexpath": "",
+        "indexpath": grib_path + ".idx",
         "filter_by_keys": {
             "typeOfLevel": type_of_level,
         },
@@ -863,6 +863,12 @@ def extract_gfs_tensor_from_file(grib_path: str) -> np.ndarray:
             except Exception:
                 pass
 
+        idx_path = grib_path + ".idx"
+        try:
+            os.remove(idx_path)
+        except OSError:
+            pass
+
 
 
 def decode_one_gfs_frame(index: int, path: str, cycle_dt: datetime, forecast_hour: int):
@@ -876,8 +882,12 @@ def decode_one_gfs_frame(index: int, path: str, cycle_dt: datetime, forecast_hou
             os.remove(path)
         except OSError:
             pass
+        try:
+            os.remove(path + ".idx")
+        except OSError:
+            pass
         # Do not force a full Python GC cycle for every frame; this is on the
-        # latency-critical path. Resources are explicitly closed below.
+        # latency-critical path.
 
 
 def download_one_gfs_frame(index: int, obs):
