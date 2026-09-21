@@ -784,32 +784,23 @@ def extract_gfs_tensor_from_file(grib_path: str) -> np.ndarray:
         gh_var = get_grib_variable(pressure_ds, ["gh", "z"])
 
         for level in PRESSURE_LEVELS:
-            arr = np.asarray(
-                u_var.sel(isobaricInhPa=level).values,
-                dtype=np.float32,
-            )
+            da = u_var.sel(isobaricInhPa=level)
             channels.append(
-                resize_81x81(standardize_channel(to_2d_numpy(arr)))
+                resize_81x81(standardize_channel(to_2d_numpy(da)))
             )
             del arr
 
         for level in PRESSURE_LEVELS:
-            arr = np.asarray(
-                v_var.sel(isobaricInhPa=level).values,
-                dtype=np.float32,
-            )
+            da = v_var.sel(isobaricInhPa=level)
             channels.append(
-                resize_81x81(standardize_channel(to_2d_numpy(arr)))
+                resize_81x81(standardize_channel(to_2d_numpy(da)))
             )
             del arr
 
         for level in PRESSURE_LEVELS:
-            arr = np.asarray(
-                gh_var.sel(isobaricInhPa=level).values,
-                dtype=np.float32,
-            )
+            da = gh_var.sel(isobaricInhPa=level)
             channels.append(
-                resize_81x81(standardize_channel(to_2d_numpy(arr)))
+                resize_81x81(standardize_channel(to_2d_numpy(da)))
             )
             del arr
 
@@ -832,9 +823,9 @@ def extract_gfs_tensor_from_file(grib_path: str) -> np.ndarray:
         temp_var = get_grib_variable(surface_ds, ["t2m", "2t"])
 
         # No .sel(heightAboveGround=2): this can be a scalar coordinate.
-        arr = np.asarray(temp_var.values, dtype=np.float32)
+        da = temp_var
         channels.append(
-            resize_81x81(standardize_channel(to_2d_numpy(arr)))
+            resize_81x81(standardize_channel(to_2d_numpy(da)))
         )
 
         tensor = np.stack(channels, axis=0).astype(
